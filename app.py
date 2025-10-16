@@ -9,6 +9,11 @@ import yfinance as yf
 from typing import Optional, Dict
 import requests
 import json
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # -------------------------
 # Configuration
@@ -16,10 +21,10 @@ import json
 DEFAULT_PAIRS = ["USDCAD=X", "EURUSD=X", "GBPUSD=X", "USDJPY=X"]
 INTERVALS = ["5m", "15m", "30m", "1h"]
 
-# Telegram notification settings (hardcoded)
-TELEGRAM_BOT_TOKEN = "8262911672:AAHxE3lB1ysY0imlPXZxMs_e-WqT6PRTEcA"
-TELEGRAM_CHAT_ID = "8238812539"
-NOTIFICATIONS_ENABLED = True
+# Telegram notification settings (from environment variables)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+NOTIFICATIONS_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 # -------------------------
 # Helpers (Indicators)
@@ -404,8 +409,12 @@ with st.sidebar:
     min_confidence = st.slider("Min. důvěra signálu (%)", 40, 80, 60)
     
     st.markdown("---")
-    st.success("📱 Telegram notifikace: **AKTIVNÍ**")
-    st.caption(f"Bot: @Oslicek_bot")
+    if NOTIFICATIONS_ENABLED:
+        st.success("📱 Telegram notifikace: **AKTIVNÍ**")
+        st.caption(f"Bot: @Oslicek_bot")
+    else:
+        st.warning("⚠️ Telegram notifikace: **NEAKTIVNÍ**")
+        st.caption("Nastav proměnné v .env souboru")
 
 # Strategy parameters
 params = {
