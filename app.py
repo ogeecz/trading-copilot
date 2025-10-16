@@ -9,15 +9,66 @@ import yfinance as yf
 from typing import Optional, Dict
 import requests
 
-# ===== KONFIGURACE (TVOJE ÚDAJE) =====
-TELEGRAM_BOT_TOKEN = "8262911672:AAHxE3lB1ysY0imlPXZxMs_e-WqT6PRTEcA"
-TELEGRAM_CHAT_ID = "8238812539"
-NOTIFICATIONS_ENABLED = True
+# ===== KONFIGURACE =====
+DEFAULT_PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY", "USD_CAD"]
+INTERVALS = ["M5", "M15", "M30", "H1"]
 
-DEFAULT_PAIRS = ["USDCAD=X", "EURUSD=X", "GBPUSD=X", "USDJPY=X"]
-INTERVALS = ["5m", "15m", "30m", "1h"]
+# Oanda to yfinance mapping
+OANDA_TO_YF = {
+    "EUR_USD": "EURUSD=X",
+    "GBP_USD": "GBPUSD=X", 
+    "USD_JPY": "USDJPY=X",
+    "USD_CAD": "USDCAD=X",
+    "AUD_USD": "AUDUSD=X",
+    "NZD_USD": "NZDUSD=X"
+}
 
-# ===== FUNKCE =====
+# ===== OANDA API FUNKCE =====
+def fetch_oanda_data(instrument: str, granularity: str, count: int, api_key: str, account_id: str) -> pd.DataFrame:
+    """Fetch real-time data from Oanda API"""
+    try:
+        url = f"https://api-fxtrade.oanda.com/v3/instruments/{instrument}/candles"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        params = {
+            "granularity": granularity,
+            "count": count
+        }
+        
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        
+        if response.status_code != 200:
+            return pd.DataFrame()
+        
+        data = response.json()
+        candles = data.get("candles", [])
+        
+        if not candles:
+            return pd.DataFrame()
+        
+        rows = []
+        for candle in candles:
+            if candle["complete"]:
+                rows.append({
+                    "Datetime": pd.to_datetime(candle["time"]),
+                    "Open": float(candle["mid"]["o"]),
+                    "High": float(candle["mid"]["h"]),
+                    "Low": float(candle["mid"]["l"]),
+                    "Close": float(candle["mid"]["c"]),
+                    "Volume": float(candle["volume"])
+                })
+        
+        df = pd.DataFrame(rows)
+        df["Datetime"] = pd.to_datetime(df["Datetime"]).dt.tz_localize(None)
+        return df
+        
+    except Exception as e:
+        st.warning(f"Oanda API chyba pro {instrument}: {str(e)}")
+        return pd.DataFrame()
+
+# ===== TECHNICKÉ INDIKÁTORY =====
 def ema(series: pd.Series, window: int) -> pd.Series:
     return series.ewm(span=window, adjust=False).mean()
 
@@ -49,8 +100,9 @@ def vwap(df: pd.DataFrame) -> pd.Series:
 def pct(x: float) -> str:
     return f"{x*100:.2f}%"
 
-def send_telegram_notification(signal: Dict, symbol: str) -> bool:
-    if not NOTIFICATIONS_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+# ===== TELEGRAM NOTIFIKACE =====
+def send_telegram_notification(bot_token: str, chat_id: str, signal: Dict, symbol: str) -> bool:
+    if not bot_token or not chat_id:
         return False
     try:
         emoji = "🟢" if signal["type"] == "BUY" else "🔴"
@@ -64,28 +116,46 @@ def send_telegram_notification(signal: Dict, symbol: str) -> bool:
             f"📝 <i>{signal['reason']}</i>\n\n"
             f"🕐 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
         )
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
         response = requests.post(url, data=payload, timeout=5)
         return response.status_code == 200
     except:
         return False
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_intraday(symbol: str, interval: str = "5m", lookback_days: int = 7) -> pd.DataFrame:
+# ===== DATA LOADING =====
+@st.cache_data(ttl=60, show_spinner=False)
+def load_data(symbol: str, interval: str, use_oanda: bool, oanda_api_key: str, oanda_account: str) -> pd.DataFrame:
+    """Load data from Oanda or yfinance fallback"""
+    
+    if use_oanda and oanda_api_key and oanda_account:
+        # Oanda API
+        count_map = {"M5": 2000, "M15": 1500, "M30": 1000, "H1": 500}
+        count = count_map.get(interval, 1000)
+        df = fetch_oanda_data(symbol, interval, count, oanda_api_key, oanda_account)
+        
+        if not df.empty:
+            return df
+        else:
+            st.warning(f"⚠️ Oanda selhala, fallback na yfinance pro {symbol}")
+    
+    # Fallback na yfinance
+    yf_symbol = OANDA_TO_YF.get(symbol, "EURUSD=X")
+    yf_interval_map = {"M5": "5m", "M15": "15m", "M30": "30m", "H1": "1h"}
+    yf_interval = yf_interval_map.get(interval, "5m")
+    
     try:
         end = datetime.now(timezone.utc)
-        start = end - timedelta(days=lookback_days)
-        df = yf.download(tickers=symbol, interval=interval, start=start.strftime("%Y-%m-%d"),
-                        end=end.strftime("%Y-%m-%d"), progress=False, auto_adjust=False, prepost=False, threads=True)
+        start = end - timedelta(days=7)
+        df = yf.download(tickers=yf_symbol, interval=yf_interval, start=start.strftime("%Y-%m-%d"),
+                        end=end.strftime("%Y-%m-%d"), progress=False, auto_adjust=False, prepost=False)
         if df.empty:
             return pd.DataFrame()
         df = df.rename_axis("Datetime").reset_index()
         if hasattr(df["Datetime"].iloc[0], "tzinfo") and df["Datetime"].dt.tz is not None:
             df["Datetime"] = df["Datetime"].dt.tz_convert("UTC").dt.tz_localize(None)
         return df
-    except Exception as e:
-        st.error(f"⚠️ Chyba při načítání {symbol}: {str(e)}")
+    except:
         return pd.DataFrame()
 
 def enrich(df: pd.DataFrame) -> pd.DataFrame:
@@ -108,10 +178,10 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         out["FromVWAP"] = from_vwap
         out["TrendUp"] = (out["EMA20"] >= out["EMA50"]).astype(int)
         return out
-    except Exception as e:
-        st.warning(f"⚠️ Chyba při výpočtu indikátorů: {str(e)}")
+    except:
         return df
 
+# ===== SIGNÁLY =====
 def signal_mean_reversion(df: pd.DataFrame, vwap_threshold: float, rsi_oversold: int, rsi_boost: int) -> Optional[Dict]:
     if len(df) < 60:
         return None
@@ -168,19 +238,15 @@ def signal_vwap_breakout(df: pd.DataFrame, rsi_min: int, rsi_max: int) -> Option
         if (prev_close <= prev_vwap) and (last_close > last_vwap) and (rsi_min <= last_rsi <= rsi_max) and (last_ema20 > last_ema50):
             entry = last_close
             risk = 1.2 * last_atr
-            sl = entry - risk
-            tp = entry + 2.0 * risk
-            conf = 55 + min(25, int((last_rsi - 50) * 2))
-            return {"type": "BUY", "entry": entry, "sl": sl, "tp": tp,
-                   "confidence": int(min(conf, 85)), "reason": f"VWAP Breakout ↑ (RSI={last_rsi:.0f})", "rr": 2.0}
+            return {"type": "BUY", "entry": entry, "sl": entry - risk, "tp": entry + 2.0 * risk,
+                   "confidence": int(min(55 + min(25, int((last_rsi - 50) * 2)), 85)),
+                   "reason": f"VWAP Breakout ↑ (RSI={last_rsi:.0f})", "rr": 2.0}
         if (prev_close >= prev_vwap) and (last_close < last_vwap) and (100 - rsi_max <= last_rsi <= 100 - rsi_min) and (last_ema20 < last_ema50):
             entry = last_close
             risk = 1.2 * last_atr
-            sl = entry + risk
-            tp = entry - 2.0 * risk
-            conf = 55 + min(25, int((50 - last_rsi) * 2))
-            return {"type": "SELL", "entry": entry, "sl": sl, "tp": tp,
-                   "confidence": int(min(conf, 85)), "reason": f"VWAP Breakout ↓ (RSI={last_rsi:.0f})", "rr": 2.0}
+            return {"type": "SELL", "entry": entry, "sl": entry + risk, "tp": entry - 2.0 * risk,
+                   "confidence": int(min(55 + min(25, int((50 - last_rsi) * 2)), 85)),
+                   "reason": f"VWAP Breakout ↓ (RSI={last_rsi:.0f})", "rr": 2.0}
     except:
         pass
     return None
@@ -199,225 +265,235 @@ def calculate_position_size(account_balance: float, risk_pct: float, entry: floa
     if risk_distance < 0.00001:
         return {"lot_size": 0.01, "risk_amount": 0.0, "pips": 0.0}
     if "JPY" in symbol:
-        pip_value = 0.01
-        pips = risk_distance / pip_value
+        pips = risk_distance / 0.01
     else:
-        pip_value = 0.0001
-        pips = risk_distance / pip_value
+        pips = risk_distance / 0.0001
     lot_size = risk_amount / (pips * 10) if pips > 0 else 0.01
     return {"lot_size": round(max(0.01, lot_size), 2), "risk_amount": round(risk_amount, 2), "pips": round(pips, 1)}
 
 # ===== STREAMLIT UI =====
 st.set_page_config(page_title="Trading Copilot Pro", layout="wide", initial_sidebar_state="expanded")
-st.markdown("<h1>🚀 Trading Copilot Pro — FX Signály</h1>", unsafe_allow_html=True)
+st.markdown("<h1>🚀 Trading Copilot Pro — Real-Time FX</h1>", unsafe_allow_html=True)
 
 with st.sidebar:
+    st.markdown("### 🔌 Data Source")
+    
+    use_oanda = st.checkbox("Použít Oanda API (real-time)", value=False)
+    
+    if use_oanda:
+        st.info("📊 **Jak získat Oanda API:**\n1. Jdi na oanda.com\n2. Vytvoř demo/live účet\n3. API → Personal Token\n4. Zkopíruj API Key a Account ID")
+        oanda_api_key = st.text_input("Oanda API Key", type="password", placeholder="abc123...")
+        oanda_account = st.text_input("Oanda Account ID", placeholder="123-456-7890123-001")
+    else:
+        st.info("📊 Použije se yfinance (5min zpoždění)")
+        oanda_api_key = ""
+        oanda_account = ""
+    
+    st.markdown("---")
     st.markdown("### ⚙️ Nastavení")
-    pairs = st.multiselect("Měnové páry", DEFAULT_PAIRS, default=DEFAULT_PAIRS)
+    
+    pairs = st.multiselect("Měnové páry", DEFAULT_PAIRS, default=DEFAULT_PAIRS[:4])
     interval = st.selectbox("Časový interval", INTERVALS, index=0)
-    lookback = st.slider("Historie (dní)", 3, 30, 7)
     
     st.markdown("---")
     st.markdown("### 💰 Risk Management")
-    account_balance = st.number_input("Velikost účtu ($)", min_value=100, max_value=1000000, value=10000, step=1000)
-    risk_per_trade = st.slider("Riziko na obchod (%)", min_value=0.5, max_value=5.0, value=1.0, step=0.5)
+    account_balance = st.number_input("Velikost účtu ($)", 100, 1000000, 10000, 1000)
+    risk_per_trade = st.slider("Riziko na obchod (%)", 0.5, 5.0, 1.0, 0.5)
     
     st.markdown("---")
-    st.markdown("### 🎯 Parametry strategií")
-    with st.expander("Mean Reversion", expanded=True):
+    st.markdown("### 🎯 Parametry")
+    with st.expander("Mean Reversion"):
         vwap_threshold = st.slider("VWAP práh (%)", 0.05, 0.50, 0.15, 0.05)
         rsi_oversold = st.slider("RSI přeprodáno", 20, 35, 30)
-        rsi_boost = st.slider("RSI extra boost", 20, 30, 25)
-    with st.expander("VWAP Breakout", expanded=True):
+        rsi_boost = st.slider("RSI boost", 20, 30, 25)
+    with st.expander("VWAP Breakout"):
         rsi_min = st.slider("RSI min", 40, 55, 50)
         rsi_max = st.slider("RSI max", 60, 70, 65)
     
     st.markdown("---")
     st.markdown("### 🔄 Auto-refresh")
-    autorefresh = st.selectbox("Obnovovací interval", ["Vypnuto", "30s", "60s", "120s"], index=2)
+    autorefresh = st.selectbox("Interval", ["Vypnuto", "30s", "60s"], index=1)
     
     st.markdown("---")
-    min_confidence = st.slider("Min. důvěra signálu (%)", 40, 80, 60)
+    min_confidence = st.slider("Min. důvěra (%)", 40, 80, 60)
     
     st.markdown("---")
-    if NOTIFICATIONS_ENABLED:
-        st.success("📱 Telegram: **AKTIVNÍ**")
+    st.markdown("### 📱 Telegram")
+    enable_telegram = st.checkbox("Zapnout notifikace", value=False)
+    if enable_telegram:
+        st.info("💡 Vyplň údaje a otestuj před použitím!")
+        telegram_token = st.text_input("Bot Token", type="password", placeholder="123:ABC...", 
+                                       help="Z @BotFather")
+        telegram_chat = st.text_input("Chat ID", placeholder="123456789",
+                                      help="Z @userinfobot - musí to být ČÍSLO!")
+        
+        # Validate and test
+        if telegram_token and telegram_chat:
+            if not telegram_chat.lstrip('-').isdigit():
+                st.error("❌ Chat ID musí být číslo (ne @username)!")
+            else:
+                if st.button("🧪 Test zprávu", use_container_width=True, type="primary"):
+                    with st.spinner("Odesílám..."):
+                        test_signal = {
+                            "type": "BUY",
+                            "entry": 1.0850,
+                            "sl": 1.0820,
+                            "tp": 1.0900,
+                            "confidence": 75,
+                            "reason": "🎉 Test z Trading Copilot - FUNGUJE!",
+                            "rr": 1.67
+                        }
+                        if send_telegram_notification(telegram_token, telegram_chat, test_signal, "EUR_USD"):
+                            st.success("✅ Telegram FUNGUJE! Zkontroluj zprávu v Telegramu 📱")
+                        else:
+                            st.error("❌ Nepodařilo se odeslat. Zkontroluj:\n- Bot Token je správný\n- Chat ID je správné číslo\n- Klikl jsi START ve svém botovi")
+        else:
+            st.warning("⚠️ Vyplň Bot Token a Chat ID")
     else:
-        st.warning("📱 Telegram: **VYPNUTO**")
+        telegram_token = ""
+        telegram_chat = ""
+        st.caption("Notifikace vypnuty")
 
 params = {
     "vwap_threshold": vwap_threshold, "rsi_oversold": rsi_oversold,
     "rsi_boost": rsi_boost, "rsi_min": rsi_min, "rsi_max": rsi_max
 }
 
-AUTO_REFRESH_SEC = {"Vypnuto": 0, "30s": 30, "60s": 60, "120s": 120}
-refresh_sec = AUTO_REFRESH_SEC.get(autorefresh, 0)
+# Auto-refresh
+AUTO_REFRESH = {"Vypnuto": 0, "30s": 30, "60s": 60}
+refresh_sec = AUTO_REFRESH.get(autorefresh, 0)
 
 if refresh_sec > 0:
     if "last_refresh" not in st.session_state:
         st.session_state.last_refresh = time.time()
-    time_since_refresh = time.time() - st.session_state.last_refresh
-    if time_since_refresh >= refresh_sec:
+    elapsed = time.time() - st.session_state.last_refresh
+    if elapsed >= refresh_sec:
         st.session_state.last_refresh = time.time()
         st.rerun()
-    remaining = int(refresh_sec - time_since_refresh)
-    st.sidebar.info(f"⏱️ Další refresh za {remaining}s")
+    st.sidebar.info(f"⏱️ Refresh za {int(refresh_sec - elapsed)}s")
 
 if "journal" not in st.session_state:
     st.session_state.journal = []
-if "notified_signals" not in st.session_state:
-    st.session_state.notified_signals = set()
+if "notified" not in st.session_state:
+    st.session_state.notified = set()
 
-st.caption(f"📊 Data: yfinance • Interval: {interval} • Aktualizace: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
+# Info bar
+data_source = "🟢 Oanda (Real-time)" if (use_oanda and oanda_api_key and oanda_account) else "🟡 yfinance (~5min delay)"
+telegram_active = enable_telegram and telegram_token and telegram_chat and telegram_chat.lstrip('-').isdigit()
+notif_status = "🔔 Telegram ON" if telegram_active else "🔕 Telegram OFF"
+st.caption(f"{data_source} • Interval: {interval} • {notif_status} • {datetime.utcnow().strftime('%H:%M:%S')} UTC")
 
+# Load data
 charts_data = {}
 rows = []
 
 with st.spinner("Načítám data..."):
     for sym in pairs:
-        df = load_intraday(sym, interval=interval, lookback_days=lookback)
+        df = load_data(sym, interval, use_oanda, oanda_api_key, oanda_account)
         if df.empty:
             rows.append([sym, "—", "—", "—", "—", "—", "—"])
             charts_data[sym] = df
             continue
+        
         df = enrich(df)
         charts_data[sym] = df
-        if df.empty or len(df) < 60:
+        
+        if len(df) < 60:
             rows.append([sym, "—", "—", "—", "—", "—", "—"])
             continue
+        
         try:
             last = df.iloc[-1]
-            required_cols = ["EMA20", "EMA50", "RSI", "FromVWAP", "Close"]
-            if not all(col in df.columns for col in required_cols):
-                rows.append([sym, "—", "—", "—", "—", "—", "—"])
-                continue
-            
-            ema20_val = float(last["EMA20"])
-            ema50_val = float(last["EMA50"])
+            ema20 = float(last["EMA20"])
+            ema50 = float(last["EMA50"])
             rsi_val = float(last["RSI"])
-            from_vwap_val = float(last["FromVWAP"])
-            close_val = float(last["Close"])
+            from_vwap = float(last["FromVWAP"])
+            close = float(last["Close"])
             
-            trend = "📈 Up" if ema20_val >= ema50_val else "📉 Down"
+            trend = "📈" if ema20 >= ema50 else "📉"
             sig = build_signal(df, params)
             
             signal_txt = "—"
             conf = "—"
-            rr = "—"
             
             if sig and sig["confidence"] >= min_confidence:
                 signal_txt = f"{'🟢' if sig['type']=='BUY' else '🔴'} {sig['type']}"
                 conf = f"{sig['confidence']}%"
-                rr = f"{sig.get('rr', 0):.2f}"
                 
-                signal_key = f"{sym}_{sig['type']}_{sig['entry']:.5f}"
-                if signal_key not in st.session_state.notified_signals:
-                    if send_telegram_notification(sig, sym):
-                        st.session_state.notified_signals.add(signal_key)
-                        if len(st.session_state.notified_signals) > 50:
-                            st.session_state.notified_signals = set(list(st.session_state.notified_signals)[-50:])
+                # Send Telegram
+                sig_key = f"{sym}_{sig['type']}_{sig['entry']:.5f}"
+                if enable_telegram and sig_key not in st.session_state.notified:
+                    if send_telegram_notification(telegram_token, telegram_chat, sig, sym):
+                        st.session_state.notified.add(sig_key)
             
-            price_fmt = f"{close_val:.5f}" if 'JPY' not in sym else f"{close_val:.3f}"
-            rows.append([sym, trend, f"{rsi_val:.0f}", pct(from_vwap_val), price_fmt, signal_txt, conf])
-        except Exception as e:
-            st.warning(f"Chyba u {sym}: {str(e)}")
+            price_fmt = f"{close:.5f}" if "JPY" not in sym else f"{close:.3f}"
+            rows.append([sym, trend, f"{rsi_val:.0f}", pct(from_vwap), price_fmt, signal_txt, conf])
+        except:
             rows.append([sym, "—", "—", "—", "—", "—", "—"])
 
-watch_df = pd.DataFrame(rows, columns=["Symbol", "Trend", "RSI", "Od VWAP", "Cena", "Signál", "Důvěra"])
+watch_df = pd.DataFrame(rows, columns=["Pár", "Trend", "RSI", "Od VWAP", "Cena", "Signál", "Důvěra"])
 
-st.markdown("### 📊 Přehled trhů")
-st.dataframe(watch_df, use_container_width=True, height=min(250, 50 + len(watch_df) * 35))
+st.markdown("### 📊 Přehled")
+st.dataframe(watch_df, use_container_width=True, height=240)
 
-st.markdown("### 🎯 Detail & Trading")
-col_left, col_right = st.columns([1.0, 1.3])
+# Detail
+st.markdown("### 🎯 Trading")
+col1, col2 = st.columns([1, 1.3])
 
-with col_left:
+with col1:
     if pairs:
-        selected_sym = st.selectbox("Vyber pár", pairs, index=0)
-        df = charts_data.get(selected_sym, pd.DataFrame())
+        sel = st.selectbox("Pár", pairs, index=0)
+        df = charts_data.get(sel, pd.DataFrame())
         
         if not df.empty and len(df) >= 60:
             sig = build_signal(df, params)
             if sig and sig["confidence"] >= min_confidence:
-                pos_info = calculate_position_size(account_balance, risk_per_trade, sig["entry"], sig["sl"], selected_sym)
-                signal_emoji = "🟢" if sig["type"] == "BUY" else "🔴"
-                st.success(
-                    f"### {signal_emoji} {sig['type']} Signal\n\n"
-                    f"**Entry:** {sig['entry']:.5f} | **SL:** {sig['sl']:.5f} | **TP:** {sig['tp']:.5f}\n\n"
-                    f"**R:R:** {sig.get('rr', 0):.2f} | **Důvěra:** {sig['confidence']}%\n\n"
-                    f"_{sig['reason']}_"
-                )
-                st.info(
-                    f"💰 **Position Size:** {pos_info['lot_size']} lots\n\n"
-                    f"**Riziko:** ${pos_info['risk_amount']} ({risk_per_trade}%)\n\n"
-                    f"**SL Distance:** {pos_info['pips']} pips"
-                )
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("✅ Vzít obchod", use_container_width=True, type="primary"):
-                        st.session_state.journal.append({
-                            "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                            "symbol": selected_sym, "type": sig["type"], "entry": sig["entry"],
-                            "sl": sig["sl"], "tp": sig["tp"], "lot_size": pos_info["lot_size"],
-                            "risk": pos_info["risk_amount"], "confidence": sig["confidence"],
-                            "reason": sig["reason"]
-                        })
-                        st.success("✅ Přidáno do deníku!")
-                with c2:
-                    st.button("⏭ Přeskočit", use_container_width=True)
+                pos = calculate_position_size(account_balance, risk_per_trade, sig["entry"], sig["sl"], sel)
+                emoji = "🟢" if sig["type"] == "BUY" else "🔴"
+                st.success(f"### {emoji} {sig['type']}\n**Entry:** {sig['entry']:.5f} | **SL:** {sig['sl']:.5f} | **TP:** {sig['tp']:.5f}\n**R:R:** {sig['rr']:.2f} | **Důvěra:** {sig['confidence']}%\n_{sig['reason']}_")
+                st.info(f"💰 {pos['lot_size']} lots • Riziko: ${pos['risk_amount']} • {pos['pips']} pips")
+                
+                if st.button("✅ Vzít obchod", use_container_width=True, type="primary"):
+                    st.session_state.journal.append({
+                        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                        "pair": sel, "type": sig["type"], "entry": sig["entry"],
+                        "sl": sig["sl"], "tp": sig["tp"], "lots": pos["lot_size"],
+                        "risk": pos["risk_amount"], "conf": sig["confidence"]
+                    })
+                    st.success("✅ V deníku!")
             else:
-                st.info("😴 Momentálně žádný silný signál")
-                st.caption(f"Min. důvěra: {min_confidence}%")
-        else:
-            st.info("📊 Načítám data nebo nedostatek historie...")
+                st.info("😴 Žádný signál")
 
-with col_right:
-    if pairs and selected_sym in charts_data:
-        df = charts_data[selected_sym]
-        if not df.empty and len(df) > 60:
-            required_chart_cols = ["Datetime", "Open", "High", "Low", "Close", "EMA20", "EMA50", "VWAP", "RSI"]
-            if all(col in df.columns for col in required_chart_cols):
-                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
-                fig.add_trace(go.Candlestick(x=df["Datetime"], open=df["Open"], high=df["High"],
-                                           low=df["Low"], close=df["Close"], name="Cena", showlegend=False), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA20"], name="EMA20", line=dict(color="cyan")), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA50"], name="EMA50", line=dict(color="orange")), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], name="VWAP", line=dict(dash="dot", color="yellow")), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df["Datetime"], y=df["RSI"], name="RSI", line=dict(color="purple")), row=2, col=1)
-                fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
-                fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, row=2, col=1)
-                fig.update_layout(height=600, template="plotly_dark", margin=dict(l=10,r=10,t=30,b=10),
-                                title=f"{selected_sym} - {interval}", xaxis_rangeslider_visible=False)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.warning("⚠️ Chybí data pro zobrazení grafu")
-
-st.markdown("### 📖 Obchodní deník")
-if st.session_state.journal:
-    journal_df = pd.DataFrame(st.session_state.journal)
-    if len(journal_df) > 0:
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Celkem obchodů", len(journal_df))
-        col2.metric("Celkové riziko", f"${journal_df['risk'].sum():.2f}")
-        col3.metric("Průměrná důvěra", f"{journal_df['confidence'].mean():.1f}%")
-    st.dataframe(journal_df, use_container_width=True, height=min(400, 50 + len(journal_df) * 35))
-    col1, col2 = st.columns([1, 5])
-    with col1:
-        if st.button("🗑️ Vymazat deník"):
-            st.session_state.journal = []
-            st.rerun()
-    with col2:
-        journal_csv = pd.DataFrame(st.session_state.journal).to_csv(index=False)
-        st.download_button("💾 Export CSV", data=journal_csv.encode("utf-8"),
-                          file_name=f"trading_journal_{datetime.now().strftime('%Y%m%d')}.csv",
-                          mime="text/csv", use_container_width=True)
-else:
-    st.info("📝 Deník je prázdný. Začni tím, že přidáš obchod z aktivního signálu.")
-
-st.markdown("---")
-col1, col2 = st.columns([3, 1])
-with col1:
-    st.caption("⚠️ **Upozornění:** Tento nástroj slouží pouze pro vzdělávací účely. "
-              "Není to investiční poradenství. Trading je rizikový. Data z yfinance mohou mít zpoždění ~5 minut.")
 with col2:
-    st.metric("📱 Telegram zpráv", len(st.session_state.notified_signals))
+    if pairs and sel in charts_data:
+        df = charts_data[sel]
+        if not df.empty and len(df) > 60:
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+            fig.add_trace(go.Candlestick(x=df["Datetime"], open=df["Open"], high=df["High"],
+                                       low=df["Low"], close=df["Close"], showlegend=False), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA20"], name="EMA20", line=dict(color="cyan")), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA50"], name="EMA50", line=dict(color="orange")), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], name="VWAP", line=dict(dash="dot", color="yellow")), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df["Datetime"], y=df["RSI"], name="RSI", line=dict(color="purple")), row=2, col=1)
+            fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, row=2)
+            fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, row=2)
+            fig.update_layout(height=600, template="plotly_dark", margin=dict(l=10,r=10,t=30,b=10),
+                            title=f"{sel} - {interval}", xaxis_rangeslider_visible=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+# Journal
+st.markdown("### 📖 Deník")
+if st.session_state.journal:
+    jdf = pd.DataFrame(st.session_state.journal)
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Obchodů", len(jdf))
+    col2.metric("Riziko", f"${jdf['risk'].sum():.2f}")
+    col3.metric("Avg důvěra", f"{jdf['conf'].mean():.0f}%")
+    st.dataframe(jdf, use_container_width=True, height=300)
+    if st.button("🗑️ Vymazat"):
+        st.session_state.journal = []
+        st.rerun()
+else:
+    st.info("📝 Prázdný deník")
+
+st.caption("⚠️ Jen pro vzdělávání • Trading je rizikový • Nejde o investiční radu")
