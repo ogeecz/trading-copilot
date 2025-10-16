@@ -47,7 +47,8 @@ def atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
 def vwap(df: pd.DataFrame) -> pd.Series:
     """Volume Weighted Average Price"""
     tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
-    vol = df["Volume"].replace(0, 1.0)
+    vol = df["Volume"].copy()
+    vol[vol == 0] = 1.0  # Replace zeros with 1 to avoid division issues
     cum_vol = vol.cumsum()
     cum_pv = (tp * vol).cumsum()
     result = cum_pv / cum_vol
@@ -101,37 +102,42 @@ def enrich(df: pd.DataFrame, ema_fast: int = 20, ema_slow: int = 50) -> pd.DataF
     
     out = df.copy()
     
-    # Moving averages
-    out["EMA20"] = ema(out["Close"], ema_fast)
-    out["EMA50"] = ema(out["Close"], ema_slow)
-    out["SMA200"] = out["Close"].rolling(200).mean()
-    
-    # Momentum
-    out["RSI"] = rsi(out["Close"], 14)
-    
-    # Volatility
-    out["VWAP"] = vwap(out)
-    out["VWAP"] = out["VWAP"].bfill().ffill()
-    
-    out["ATR"] = atr(out, 14)
-    out["ATR"] = out["ATR"].bfill().ffill()
-    
-    # Bollinger Bands
-    bb_upper, bb_mid, bb_lower = bollinger_bands(out["Close"], 20, 2.0)
-    out["BB_Upper"] = bb_upper
-    out["BB_Mid"] = bb_mid
-    out["BB_Lower"] = bb_lower
-    
-    # Derived metrics - safe division
-    out["FromVWAP"] = 0.0
-    vwap_nonzero = out["VWAP"] > 0.0001
-    out.loc[vwap_nonzero, "FromVWAP"] = (out.loc[vwap_nonzero, "Close"] / out.loc[vwap_nonzero, "VWAP"]) - 1.0
-    
-    out["TrendUp"] = (out["EMA20"] >= out["EMA50"]).astype(int)
-    
-    out["BB_Width"] = 0.0
-    bb_mid_nonzero = out["BB_Mid"] > 0.0001
-    out.loc[bb_mid_nonzero, "BB_Width"] = (out.loc[bb_mid_nonzero, "BB_Upper"] - out.loc[bb_mid_nonzero, "BB_Lower"]) / out.loc[bb_mid_nonzero, "BB_Mid"]
+    try:
+        # Moving averages
+        out["EMA20"] = ema(out["Close"], ema_fast)
+        out["EMA50"] = ema(out["Close"], ema_slow)
+        out["SMA200"] = out["Close"].rolling(200).mean()
+        
+        # Momentum
+        out["RSI"] = rsi(out["Close"], 14)
+        
+        # Volatility
+        out["VWAP"] = vwap(out)
+        out["VWAP"] = out["VWAP"].bfill().ffill()
+        
+        out["ATR"] = atr(out, 14)
+        out["ATR"] = out["ATR"].bfill().ffill()
+        
+        # Bollinger Bands
+        bb_upper, bb_mid, bb_lower = bollinger_bands(out["Close"], 20, 2.0)
+        out["BB_Upper"] = bb_upper
+        out["BB_Mid"] = bb_mid
+        out["BB_Lower"] = bb_lower
+        
+        # Derived metrics - safe division (step by step to avoid pandas errors)
+        out["FromVWAP"] = (out["Close"] / out["VWAP"]) - 1.0
+        out["FromVWAP"] = out["FromVWAP"].fillna(0)
+        out["FromVWAP"] = out["FromVWAP"].replace([np.inf, -np.inf], 0)
+        
+        out["TrendUp"] = (out["EMA20"] >= out["EMA50"]).astype(int)
+        
+        out["BB_Width"] = (out["BB_Upper"] - out["BB_Lower"]) / out["BB_Mid"]
+        out["BB_Width"] = out["BB_Width"].fillna(0)
+        out["BB_Width"] = out["BB_Width"].replace([np.inf, -np.inf], 0)
+        
+    except Exception as e:
+        st.warning(f"Chyba při výpočtu indikátorů: {str(e)}")
+        return df
     
     return out
 
