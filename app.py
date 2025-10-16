@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 
 # -------------------------
 # Configuration
@@ -47,10 +47,11 @@ def atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
 def vwap(df: pd.DataFrame) -> pd.Series:
     """Volume Weighted Average Price"""
     tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
-    vol = df["Volume"].replace(0, np.nan).fillna(1.0)
+    vol = df["Volume"].replace(0, 1.0)
     cum_vol = vol.cumsum()
     cum_pv = (tp * vol).cumsum()
-    return cum_pv / cum_vol
+    result = cum_pv / cum_vol
+    return result
 
 def bollinger_bands(series: pd.Series, window: int = 20, num_std: float = 2.0):
     """Bollinger Bands"""
@@ -95,8 +96,9 @@ def load_intraday(symbol: str, interval: str = "5m", lookback_days: int = 7) -> 
 
 def enrich(df: pd.DataFrame, ema_fast: int = 20, ema_slow: int = 50) -> pd.DataFrame:
     """Add technical indicators to dataframe"""
-    if df.empty:
+    if df.empty or len(df) < 60:
         return df
+    
     out = df.copy()
     
     # Moving averages
@@ -108,8 +110,11 @@ def enrich(df: pd.DataFrame, ema_fast: int = 20, ema_slow: int = 50) -> pd.DataF
     out["RSI"] = rsi(out["Close"], 14)
     
     # Volatility
-    out["VWAP"] = vwap(out).bfill().ffill()
-    out["ATR"] = atr(out, 14).bfill().ffill()
+    out["VWAP"] = vwap(out)
+    out["VWAP"] = out["VWAP"].bfill().ffill()
+    
+    out["ATR"] = atr(out, 14)
+    out["ATR"] = out["ATR"].bfill().ffill()
     
     # Bollinger Bands
     bb_upper, bb_mid, bb_lower = bollinger_bands(out["Close"], 20, 2.0)
@@ -117,18 +122,16 @@ def enrich(df: pd.DataFrame, ema_fast: int = 20, ema_slow: int = 50) -> pd.DataF
     out["BB_Mid"] = bb_mid
     out["BB_Lower"] = bb_lower
     
-    # Derived metrics (safe calculation to avoid division by zero)
-    # FromVWAP calculation
+    # Derived metrics - safe division
     out["FromVWAP"] = 0.0
-    mask = out["VWAP"] != 0
-    out.loc[mask, "FromVWAP"] = (out.loc[mask, "Close"] / out.loc[mask, "VWAP"]) - 1.0
+    vwap_nonzero = out["VWAP"] > 0.0001
+    out.loc[vwap_nonzero, "FromVWAP"] = (out.loc[vwap_nonzero, "Close"] / out.loc[vwap_nonzero, "VWAP"]) - 1.0
     
     out["TrendUp"] = (out["EMA20"] >= out["EMA50"]).astype(int)
     
-    # BB_Width calculation
     out["BB_Width"] = 0.0
-    mask_bb = out["BB_Mid"] != 0
-    out.loc[mask_bb, "BB_Width"] = (out.loc[mask_bb, "BB_Upper"] - out.loc[mask_bb, "BB_Lower"]) / out.loc[mask_bb, "BB_Mid"]
+    bb_mid_nonzero = out["BB_Mid"] > 0.0001
+    out.loc[bb_mid_nonzero, "BB_Width"] = (out.loc[bb_mid_nonzero, "BB_Upper"] - out.loc[bb_mid_nonzero, "BB_Lower"]) / out.loc[bb_mid_nonzero, "BB_Mid"]
     
     return out
 
@@ -137,6 +140,9 @@ def enrich(df: pd.DataFrame, ema_fast: int = 20, ema_slow: int = 50) -> pd.DataF
 # -------------------------
 def signal_mean_reversion(df: pd.DataFrame, vwap_threshold: float, rsi_oversold: int, rsi_boost: int) -> Optional[Dict]:
     """Mean reversion strategy to VWAP"""
+    if len(df) < 60:
+        return None
+    
     row = df.iloc[-1]
     cond = (
         (row["FromVWAP"] <= -vwap_threshold/100) and 
@@ -150,9 +156,14 @@ def signal_mean_reversion(df: pd.DataFrame, vwap_threshold: float, rsi_oversold:
     sl = entry - 1.5 * float(row["ATR"])
     tp = float(row["VWAP"])
     
+    if abs(tp - entry) < 0.00001:
+        return None
+    
     conf = 60 + min(20, int(abs(row["FromVWAP"]) * 10000 / 2))
     if row["RSI"] < rsi_boost:
         conf += 5
+    
+    rr = abs((tp - entry) / (entry - sl)) if abs(entry - sl) > 0.00001 else 0
     
     return {
         "type": "BUY",
@@ -161,7 +172,7 @@ def signal_mean_reversion(df: pd.DataFrame, vwap_threshold: float, rsi_oversold:
         "tp": tp,
         "confidence": int(min(conf, 90)),
         "reason": f"Mean Reversion→VWAP (RSI={row['RSI']:.0f}, {pct(row['FromVWAP'])} od VWAP)",
-        "rr": abs((tp - entry) / (entry - sl))
+        "rr": rr
     }
 
 def signal_vwap_breakout(df: pd.DataFrame, rsi_min: int, rsi_max: int) -> Optional[Dict]:
@@ -223,6 +234,7 @@ def signal_bollinger_bounce(df: pd.DataFrame) -> Optional[Dict]:
         entry = float(last["Close"])
         sl = entry - 1.5 * float(last["ATR"])
         tp = float(last["BB_Mid"])
+        rr = abs((tp - entry) / (entry - sl)) if abs(entry - sl) > 0.00001 else 0
         return {
             "type": "BUY",
             "entry": entry,
@@ -230,7 +242,7 @@ def signal_bollinger_bounce(df: pd.DataFrame) -> Optional[Dict]:
             "tp": tp,
             "confidence": 65,
             "reason": f"BB Bounce ↑ (RSI={last['RSI']:.0f})",
-            "rr": abs((tp - entry) / (entry - sl))
+            "rr": rr
         }
     
     # Bounce from upper band
@@ -238,6 +250,7 @@ def signal_bollinger_bounce(df: pd.DataFrame) -> Optional[Dict]:
         entry = float(last["Close"])
         sl = entry + 1.5 * float(last["ATR"])
         tp = float(last["BB_Mid"])
+        rr = abs((tp - entry) / (entry - sl)) if abs(entry - sl) > 0.00001 else 0
         return {
             "type": "SELL",
             "entry": entry,
@@ -245,7 +258,7 @@ def signal_bollinger_bounce(df: pd.DataFrame) -> Optional[Dict]:
             "tp": tp,
             "confidence": 65,
             "reason": f"BB Bounce ↓ (RSI={last['RSI']:.0f})",
-            "rr": abs((tp - entry) / (entry - sl))
+            "rr": rr
         }
     
     return None
@@ -259,7 +272,7 @@ def build_signal(df: pd.DataFrame, params: Dict) -> Optional[Dict]:
     sig = signal_mean_reversion(df, params["vwap_threshold"], params["rsi_oversold"], params["rsi_boost"])
     if sig is None:
         sig = signal_vwap_breakout(df, params["rsi_min"], params["rsi_max"])
-    if sig is None and params["enable_bb"]:
+    if sig is None and params.get("enable_bb", True):
         sig = signal_bollinger_bounce(df)
     
     return sig
@@ -272,7 +285,10 @@ def calculate_position_size(account_balance: float, risk_pct: float, entry: floa
     risk_amount = account_balance * (risk_pct / 100)
     risk_distance = abs(entry - sl)
     
-    # Pip value calculation (simplified)
+    if risk_distance < 0.00001:
+        return {"lot_size": 0.0, "risk_amount": 0.0, "pips": 0.0}
+    
+    # Pip value calculation
     if "JPY" in symbol:
         pip_value = 0.01
         pips = risk_distance / pip_value
@@ -280,11 +296,11 @@ def calculate_position_size(account_balance: float, risk_pct: float, entry: floa
         pip_value = 0.0001
         pips = risk_distance / pip_value
     
-    # Standard lot = 100,000 units, pip value ≈ $10
-    lot_size = risk_amount / (pips * 10)
+    # Standard lot = 100,000 units
+    lot_size = risk_amount / (pips * 10) if pips > 0 else 0
     
     return {
-        "lot_size": round(lot_size, 2),
+        "lot_size": round(max(0.01, lot_size), 2),
         "risk_amount": round(risk_amount, 2),
         "pips": round(pips, 1)
     }
@@ -298,19 +314,17 @@ def run_backtest(df: pd.DataFrame, params: Dict) -> Dict:
         return {"error": "Nedostatek dat pro backtest"}
     
     trades = []
-    equity = [10000]  # Starting capital
+    equity = [10000]
     
     for i in range(60, len(df)):
         hist = df.iloc[:i+1].copy()
         sig = build_signal(hist, params)
         
         if sig:
-            # Simulate trade
             entry = sig["entry"]
             sl = sig["sl"]
             tp = sig["tp"]
             
-            # Look ahead to see what happened
             future = df.iloc[i+1:min(i+50, len(df))]
             if future.empty:
                 continue
@@ -331,7 +345,7 @@ def run_backtest(df: pd.DataFrame, params: Dict) -> Dict:
             else:
                 continue
             
-            equity.append(equity[-1] + pnl * 10000)  # Scale for visualization
+            equity.append(equity[-1] + pnl * 10000)
             trades.append({
                 "entry": entry,
                 "exit": tp if result == "WIN" else sl,
@@ -346,6 +360,9 @@ def run_backtest(df: pd.DataFrame, params: Dict) -> Dict:
     wins = [t for t in trades if t["result"] == "WIN"]
     losses = [t for t in trades if t["result"] == "LOSS"]
     
+    total_wins = sum([t["pnl"] for t in wins]) if wins else 0
+    total_losses = abs(sum([t["pnl"] for t in losses])) if losses else 0
+    
     return {
         "total_trades": len(trades),
         "wins": len(wins),
@@ -353,7 +370,7 @@ def run_backtest(df: pd.DataFrame, params: Dict) -> Dict:
         "win_rate": len(wins) / len(trades) * 100 if trades else 0,
         "avg_win": np.mean([t["pnl"] for t in wins]) if wins else 0,
         "avg_loss": np.mean([abs(t["pnl"]) for t in losses]) if losses else 0,
-        "profit_factor": abs(sum([t["pnl"] for t in wins]) / sum([t["pnl"] for t in losses])) if losses else 0,
+        "profit_factor": total_wins / total_losses if total_losses > 0 else 0,
         "equity_curve": equity,
         "trades": trades
     }
@@ -386,16 +403,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
 st.markdown("""
 <style>
     .stAlert > div { padding: 0.5rem 1rem; }
-    .metric-card { 
-        background: #1e1e1e; 
-        padding: 1rem; 
-        border-radius: 0.5rem; 
-        border: 1px solid #333;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -407,7 +417,6 @@ st.markdown("<h1>🚀 Trading Copilot Pro — FX Signály</h1>", unsafe_allow_ht
 with st.sidebar:
     st.markdown("### ⚙️ Nastavení")
     
-    # Market selection
     pairs = st.multiselect(
         "Měnové páry",
         DEFAULT_PAIRS,
@@ -498,7 +507,6 @@ if refresh_sec > 0:
         st.session_state.last_refresh = time.time()
         st.rerun()
     
-    # Show countdown
     remaining = int(refresh_sec - time_since_refresh)
     st.sidebar.info(f"⏱️ Další refresh za {remaining}s")
 
@@ -609,7 +617,6 @@ with col_left:
             sig = build_signal(df, params)
             
             if sig and sig["confidence"] >= min_confidence:
-                # Calculate position size
                 pos_info = calculate_position_size(
                     account_balance,
                     risk_per_trade,
@@ -618,7 +625,6 @@ with col_left:
                     selected_sym
                 )
                 
-                # Signal card
                 signal_emoji = "🟢" if sig["type"] == "BUY" else "🔴"
                 st.success(
                     f"### {signal_emoji} {sig['type']} Signal\n\n"
@@ -627,14 +633,12 @@ with col_left:
                     f"_{sig['reason']}_"
                 )
                 
-                # Position sizing info
                 st.info(
                     f"💰 **Position Size:** {pos_info['lot_size']} lots\n\n"
                     f"**Riziko:** ${pos_info['risk_amount']} ({risk_per_trade}%)\n\n"
                     f"**SL Distance:** {pos_info['pips']} pips"
                 )
                 
-                # Action buttons
                 c1, c2, c3 = st.columns(3)
                 with c1:
                     if st.button("✅ Vzít obchod", use_container_width=True, type="primary"):
@@ -676,11 +680,10 @@ with col_left:
                 st.caption(f"Min. důvěra: {min_confidence}% (nastav v sidebaru)")
 
 with col_right:
-    if selected_sym and selected_sym in charts_data:
+    if pairs and selected_sym in charts_data:
         df = charts_data[selected_sym]
         
         if not df.empty and len(df) > 60:
-            # Main price chart
             fig = make_subplots(
                 rows=2, cols=1,
                 shared_xaxes=True,
@@ -688,7 +691,6 @@ with col_right:
                 row_heights=[0.7, 0.3]
             )
             
-            # Candlestick
             fig.add_trace(
                 go.Candlestick(
                     x=df["Datetime"],
@@ -702,14 +704,12 @@ with col_right:
                 row=1, col=1
             )
             
-            # Indicators
             fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA20"], name="EMA20", line=dict(color="cyan")), row=1, col=1)
             fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA50"], name="EMA50", line=dict(color="orange")), row=1, col=1)
             fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], name="VWAP", line=dict(dash="dot", color="yellow")), row=1, col=1)
             fig.add_trace(go.Scatter(x=df["Datetime"], y=df["BB_Upper"], name="BB Upper", line=dict(dash="dot", color="gray"), opacity=0.5), row=1, col=1)
             fig.add_trace(go.Scatter(x=df["Datetime"], y=df["BB_Lower"], name="BB Lower", line=dict(dash="dot", color="gray"), opacity=0.5), row=1, col=1)
             
-            # RSI
             fig.add_trace(go.Scatter(x=df["Datetime"], y=df["RSI"], name="RSI", line=dict(color="purple")), row=2, col=1)
             fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
             fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, row=2, col=1)
@@ -728,7 +728,7 @@ with col_right:
 # Backtest Section
 # -------------------------
 with st.expander("📊 Backtest strategií", expanded=False):
-    if selected_sym and selected_sym in charts_data:
+    if pairs and selected_sym in charts_data:
         df_bt = charts_data[selected_sym]
         
         if not df_bt.empty:
@@ -739,14 +739,12 @@ with st.expander("📊 Backtest strategií", expanded=False):
                     if "error" in results:
                         st.warning(results["error"])
                     else:
-                        # Metrics
                         col1, col2, col3, col4 = st.columns(4)
                         col1.metric("Počet obchodů", results["total_trades"])
                         col2.metric("Win Rate", f"{results['win_rate']:.1f}%")
                         col3.metric("Profit Factor", f"{results['profit_factor']:.2f}")
                         col4.metric("Avg Win/Loss", f"{results['avg_win']:.5f} / {results['avg_loss']:.5f}")
                         
-                        # Equity curve
                         if results["equity_curve"]:
                             fig_eq = go.Figure()
                             fig_eq.add_trace(go.Scatter(
@@ -763,7 +761,6 @@ with st.expander("📊 Backtest strategií", expanded=False):
                             )
                             st.plotly_chart(fig_eq, use_container_width=True)
                         
-                        # Trade list
                         if results["trades"]:
                             st.markdown("**Poslední obchody:**")
                             trades_df = pd.DataFrame(results["trades"][-10:])
@@ -777,7 +774,6 @@ st.markdown("### 📖 Obchodní deník")
 if st.session_state.journal:
     journal_df = pd.DataFrame(st.session_state.journal)
     
-    # Summary metrics
     if len(journal_df) > 0:
         col1, col2, col3, col4 = st.columns(4)
         total_trades = len(journal_df)
@@ -789,14 +785,12 @@ if st.session_state.journal:
         col3.metric("Průměrná důvěra", f"{avg_confidence:.1f}%")
         col4.metric("Otevřené pozice", len(journal_df[journal_df["status"] == "OPEN"]))
     
-    # Journal table
     st.dataframe(
         journal_df,
         use_container_width=True,
         height=min(400, 50 + len(journal_df) * 35)
     )
     
-    # Actions
     col1, col2 = st.columns([1, 5])
     with col1:
         if st.button("🗑️ Vymazat deník", use_container_width=True):
@@ -814,4 +808,4 @@ st.caption(
     "Není to investiční poradenství. Trading je rizikový. "
     "Data z yfinance mohou mít zpoždění ~5 minut."
 )
-st.caption(f"💻 Trading Copilot Pro v1.0 | Made with ❤️ by ogeecz")
+st.caption(f"💻 Trading Copilot Pro v1.0")
