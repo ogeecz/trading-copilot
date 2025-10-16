@@ -437,39 +437,159 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 🔔 Notifikace")
     
+    # Initialize notification settings in session state
+    if "notification_type" not in st.session_state:
+        st.session_state.notification_type = "Vypnuto"
+    
+    # Load from secrets if available
+    try:
+        default_token = st.secrets.get("telegram", {}).get("bot_token", "")
+        default_chat_id = st.secrets.get("telegram", {}).get("chat_id", "")
+    except:
+        default_token = ""
+        default_chat_id = ""
+    
+    if "telegram_bot_token" not in st.session_state:
+        st.session_state.telegram_bot_token = default_token
+    if "telegram_chat_id" not in st.session_state:
+        st.session_state.telegram_chat_id = default_chat_id
+    if "discord_webhook" not in st.session_state:
+        st.session_state.discord_webhook = ""
+    
+    # Auto-enable Telegram if secrets are configured
+    if default_token and default_chat_id and st.session_state.notification_type == "Vypnuto":
+        st.session_state.notification_type = "Telegram"
+    
     notification_type = st.selectbox(
         "Typ notifikace",
         ["Vypnuto", "Telegram", "Discord"],
-        index=0
+        index=["Vypnuto", "Telegram", "Discord"].index(st.session_state.notification_type),
+        key="notif_type_select"
     )
+    st.session_state.notification_type = notification_type
     
     telegram_bot_token = ""
     telegram_chat_id = ""
     discord_webhook = ""
     
     if notification_type == "Telegram":
-        st.info("📱 **Jak nastavit Telegram:**\n1. Otevři [@BotFather](https://t.me/botfather)\n2. Napiš `/newbot` a vytvoř bota\n3. Zkopíruj Bot Token\n4. Najdi svůj Chat ID přes [@userinfobot](https://t.me/userinfobot)")
-        telegram_bot_token = st.text_input("Bot Token", type="password", placeholder="123456:ABC-DEF...")
-        telegram_chat_id = st.text_input("Chat ID", placeholder="123456789")
+        # Check if credentials are loaded from secrets
+        has_secrets = bool(default_token and default_chat_id)
         
-        if st.button("🧪 Testovat Telegram"):
-            test_signal = {
-                "type": "BUY",
-                "entry": 1.2345,
-                "sl": 1.2300,
-                "tp": 1.2400,
-                "confidence": 75,
-                "reason": "Test notifikace",
-                "rr": 1.5
-            }
-            if send_telegram_notification(telegram_bot_token, telegram_chat_id, test_signal, "TEST"):
-                st.success("✅ Telegram funguje!")
-            else:
-                st.error("❌ Zkontroluj token a chat ID")
+        if has_secrets:
+            st.success("✅ Telegram údaje načteny z konfigurace!")
+        
+        st.markdown("📱 **Jak nastavit Telegram:**")
+        
+        with st.expander("📖 Krok za krokem návod", expanded=not has_secrets):
+            st.markdown("""
+            **1. Vytvoř bota:**
+            - Otevři @BotFather: https://t.me/botfather
+            - Napiš: `/newbot`
+            - Zadej jméno: např. `My Trading Bot`
+            - Zadej username: např. `MyTrading123_bot` (musí končit na `_bot`)
+            - Zkopíruj **Bot Token**
+            
+            **2. Spusť bota:**
+            - Otevři svého nového bota (klikni na odkaz od BotFathera)
+            - Klikni **START** nebo napiš `/start`
+            - ⚠️ **BEZ TOHOTO KROKU TO NEBUDE FUNGOVAT!**
+            
+            **3. Najdi své Chat ID (TVOJE číslo, ne username bota!):**
+            
+            **Způsob A - jednodušší:**
+            - Otevři @userinfobot: https://t.me/userinfobot
+            - Klikni START
+            - Bot ti pošle tvoje **ID** (číslo jako `123456789`)
+            
+            **Způsob B - přes API:**
+            - Otevři v prohlížeči: `https://api.telegram.org/bot[BOT_TOKEN]/getUpdates`
+            - Nahraď `[BOT_TOKEN]` za svůj token
+            - Najdi `"chat":{"id":123456789}` - to je tvoje ID!
+            
+            **4. Ulož natrvalo (volitelné):**
+            - Vytvoř soubor `.streamlit/secrets.toml` ve stejné složce jako app.py
+            - Přidej:
+            ```
+            [telegram]
+            bot_token = "tvůj_token"
+            chat_id = "tvoje_id"
+            ```
+            - Při dalším spuštění se načte automaticky!
+            """)
+        
+        if not has_secrets:
+            st.info("💡 **Důležité:** Chat ID je ČÍSLO (např. `123456789`), ne username s @ !")
+        
+        telegram_bot_token = st.text_input(
+            "Bot Token", 
+            value=st.session_state.telegram_bot_token,
+            type="password", 
+            placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz",
+            help="Token z @BotFather (formát: číslo:text)" + (" - načteno z konfigurace" if has_secrets else ""),
+            disabled=has_secrets
+        )
+        if not has_secrets:
+            st.session_state.telegram_bot_token = telegram_bot_token
+        
+        telegram_chat_id = st.text_input(
+            "Chat ID (TVOJE číslo, ne @username!)", 
+            value=st.session_state.telegram_chat_id,
+            placeholder="123456789",
+            help="Tvoje numeric ID z @userinfobot - JE TO ČÍSLO, ne @username!" + (" - načteno z konfigurace" if has_secrets else ""),
+            disabled=has_secrets
+        )
+        if not has_secrets:
+            st.session_state.telegram_chat_id = telegram_chat_id
+        
+        # Validate chat ID format
+        if telegram_chat_id and not telegram_chat_id.lstrip('-').isdigit():
+            st.error("❌ Chat ID musí být ČÍSLO! Například: `123456789` nebo `-123456789`\n\n"
+                    "Nemá to být `@username`! Použij @userinfobot pro zjištění tvého ID.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🧪 Test zpráva", type="primary", use_container_width=True):
+                if not telegram_bot_token or not telegram_chat_id:
+                    st.error("❌ Vyplň Bot Token i Chat ID!")
+                elif not telegram_chat_id.lstrip('-').isdigit():
+                    st.error("❌ Chat ID musí být číslo, ne @username!")
+                else:
+                    with st.spinner("Odesílám test..."):
+                        test_signal = {
+                            "type": "BUY",
+                            "entry": 1.2345,
+                            "sl": 1.2300,
+                            "tp": 1.2400,
+                            "confidence": 75,
+                            "reason": "🎉 Test notifikace - Trading Copilot funguje!",
+                            "rr": 1.5
+                        }
+                        if send_telegram_notification(telegram_bot_token, telegram_chat_id, test_signal, "TEST"):
+                            st.success("✅ Telegram funguje! Zkontroluj zprávu v Telegramu 📱")
+                        else:
+                            st.markdown("""
+                            **Checklist:**
+                            - ✓ Klikl jsi START ve svém botovi?
+                            - ✓ Chat ID je ČÍSLO (ne @username)?
+                            - ✓ Token je správně zkopírovaný?
+                            """)
+        
+        with col2:
+            if st.button("🗑️ Smazat údaje", use_container_width=True):
+                st.session_state.telegram_bot_token = ""
+                st.session_state.telegram_chat_id = ""
+                st.rerun()
     
     elif notification_type == "Discord":
         st.info("💬 **Jak nastavit Discord:**\n1. Otevři Server Settings\n2. Integrations → Webhooks\n3. New Webhook\n4. Zkopíruj Webhook URL")
-        discord_webhook = st.text_input("Webhook URL", type="password", placeholder="https://discord.com/api/webhooks/...")
+        discord_webhook = st.text_input(
+            "Webhook URL",
+            value=st.session_state.discord_webhook,
+            type="password",
+            placeholder="https://discord.com/api/webhooks/..."
+        )
+        st.session_state.discord_webhook = discord_webhook
         
         if st.button("🧪 Testovat Discord"):
             test_signal = {
