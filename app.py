@@ -1,16 +1,4 @@
-def is_news_time(currency: str, events: List[Dict], buffer_minutes: int = 30) -> Optional[tuple]:
-    """Check if we're near news event and return (event, time_to_event_min)"""
-    now = datetime.utcnow()
-    for event in events:
-        if event["impact"] != "HIGH":
-            continue
-        # Check if this news affects the currency
-        event_currencies = event.get("currency", "")
-        if any(curr in currency for curr in ["EUR", "USD", "GBP", "JPY", "CAD", "AUD", "NZD"]):
-            time_to_event = (event["time"] - now).total_seconds() / 60
-            if -buffer_minutes <= time_to_event <= buffer_minutes:
-                return (event, int(time_to_event))
-    return Noneimport time
+import time
 from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
@@ -32,10 +20,7 @@ st.set_page_config(
 # ===== CUSTOM CSS =====
 st.markdown("""
 <style>
-    /* Main background */
     .main { background-color: #0e1117; }
-    
-    /* Headers */
     h1 { 
         color: #00d4ff !important; 
         font-weight: 700 !important;
@@ -47,21 +32,15 @@ st.markdown("""
     }
     h2 { color: #00d4ff !important; font-size: 1.5rem !important; }
     h3 { color: #7dd3fc !important; font-size: 1.2rem !important; }
-    
-    /* Cards */
     .stAlert { 
         border-radius: 12px !important;
         border-left: 4px solid #00d4ff !important;
     }
-    
-    /* Metrics */
     [data-testid="stMetricValue"] {
         font-size: 1.8rem !important;
         font-weight: 700 !important;
         color: #00d4ff !important;
     }
-    
-    /* Buttons */
     .stButton>button {
         border-radius: 8px !important;
         font-weight: 600 !important;
@@ -71,24 +50,182 @@ st.markdown("""
         transform: translateY(-2px) !important;
         box-shadow: 0 4px 12px rgba(0,212,255,0.3) !important;
     }
-    
-    /* Sidebar */
     [data-testid="stSidebar"] {
         background: linear-gradient(180deg, #1a1d29 0%, #0e1117 100%) !important;
     }
-    
-    /* Dataframe */
-    [data-testid="stDataFrame"] {
-        border-radius: 8px !important;
+    .commodity-card {
+        background: rgba(30, 41, 59, 0.5);
+        border-radius: 8px;
+        padding: 12px;
+        margin: 8px 0;
+        border-left: 3px solid #00d4ff;
     }
-    
-    /* Success/Error boxes */
-    .stSuccess { background-color: rgba(34, 197, 94, 0.1) !important; }
-    .stError { background-color: rgba(239, 68, 68, 0.1) !important; }
-    .stWarning { background-color: rgba(245, 158, 11, 0.1) !important; }
-    .stInfo { background-color: rgba(59, 130, 246, 0.1) !important; }
 </style>
 """, unsafe_allow_html=True)
+
+# ===== KORELACE TRHŮ =====
+MARKET_CORRELATIONS = {
+    "EUR/USD": {
+        "commodities": {
+            "Natural Gas": {"correlation": "INVERSE", "strength": "MEDIUM", "symbol": "NG=F"},
+            "S&P500": {"correlation": "DIRECT", "strength": "MEDIUM", "symbol": "^GSPC"}
+        },
+        "description": "EUR slábne při drahém plynu (energie krize), sílí při risk-on (akcie up)"
+    },
+    "GBP/USD": {
+        "commodities": {
+            "Brent Oil": {"correlation": "DIRECT", "strength": "WEAK", "symbol": "BZ=F"},
+            "S&P500": {"correlation": "DIRECT", "strength": "MEDIUM", "symbol": "^GSPC"}
+        },
+        "description": "GBP jako risk asset - sílí při optimismu (akcie up)"
+    },
+    "USD/JPY": {
+        "commodities": {
+            "S&P500": {"correlation": "DIRECT", "strength": "STRONG", "symbol": "^GSPC"},
+            "VIX": {"correlation": "INVERSE", "strength": "STRONG", "symbol": "^VIX"}
+        },
+        "description": "JPY = safe haven. Risk-off (akcie ↓, VIX ↑) → JPY sílí → USD/JPY ↓"
+    },
+    "USD/CAD": {
+        "commodities": {
+            "WTI Crude": {"correlation": "INVERSE", "strength": "VERY STRONG", "symbol": "CL=F"},
+            "Brent Oil": {"correlation": "INVERSE", "strength": "VERY STRONG", "symbol": "BZ=F"}
+        },
+        "description": "Kanada = 4. největší producent ropy. Ropa ↑ → CAD ↑ → USD/CAD ↓"
+    },
+    "AUD/USD": {
+        "commodities": {
+            "Gold": {"correlation": "DIRECT", "strength": "STRONG", "symbol": "GC=F"},
+            "Iron Ore": {"correlation": "DIRECT", "strength": "STRONG", "symbol": "IRON.AX"},
+            "Copper": {"correlation": "DIRECT", "strength": "MEDIUM", "symbol": "HG=F"}
+        },
+        "description": "Austrálie = biggest miner. Zlato/rudy ↑ → AUD ↑. Watch China demand!"
+    },
+    "NZD/USD": {
+        "commodities": {
+            "Dairy": {"correlation": "DIRECT", "strength": "MEDIUM", "symbol": None},
+            "Gold": {"correlation": "DIRECT", "strength": "MEDIUM", "symbol": "GC=F"}
+        },
+        "description": "NZ = dairy exporter. Mléčné výrobky ↑ → NZD ↑"
+    }
+}
+
+# ===== ROZŠÍŘENÁ DATABÁZE ZPRÁV =====
+NEWS_DATABASE = {
+    "NFP": {
+        "full_name": "Non-Farm Payrolls (USA)",
+        "impact": "⚡⚡⚡ EXTREME",
+        "description": "Měsíční zpráva o počtu nových pracovních míst mimo zemědělství v USA",
+        "typical_move": "50-150 pips první minuta, 100-300 pips celkem",
+        "affects": ["USD/*", "Gold", "S&P500", "VIX"],
+        "strategies": {
+            "15-30min before": "🎯 Identifikuj 30min range → nastav pending orders +/- 15 pips",
+            "0-5min during": "🚫 NEOBCHODUJ! Extreme chaos, spreads 30+ pips, slippage brutal",
+            "5-15min after": "⚡ Ride momentum pokud clear direction + RSI mezi 40-60",
+            "15-30min after": "🔄 Fade overreaction pokud RSI>75 nebo <25, target VWAP"
+        },
+        "watch_out": [
+            "První spike (0-2min) často fake - čekej stabilizaci",
+            "Spreads se rozšíří 10-15x normálu (2→30 pips)",
+            "Actual vs Expected je klíč - rozdíl 50k+ = massive move",
+            "Revize předchozího měsíce může být důležitější než aktuální číslo"
+        ],
+        "historical_stats": {
+            "avg_move": "85 pips",
+            "first_spike_reversal": "68%",
+            "best_strategy": "Fade first spike (65% win rate)",
+            "worst_time": "First 3 minutes (32% win rate)"
+        }
+    },
+    "FOMC": {
+        "full_name": "FOMC Meeting (Federal Reserve)",
+        "impact": "⚡⚡⚡ EXTREME", 
+        "description": "Fed rozhoduje o úrokových sazbách - nejvýznamnější event pro USD",
+        "typical_move": "30-100 pips statement, 50-200 pips press conference",
+        "affects": ["USD/*", "Gold", "All stocks", "Bonds"],
+        "strategies": {
+            "Before": "🚫 Flat position! Outcome je 50/50, často leaked",
+            "Statement (14:00 EST)": "⏸️ Počkej 2-3 minuty na initial reaction",
+            "Press Conference": "🎤 Powell's tone je klíč - hawkish/dovish důležitější než sazby",
+            "After": "📊 Obchoduj podle dot plot a forward guidance"
+        },
+        "watch_out": [
+            "Rate decision často priced-in → reakce malá",
+            "Forward guidance + dot plot = skutečný katalyzátor",
+            "Powell může změnit směr trhu jednou větou",
+            "Watch bond yields - řídí USD víc než forex traders"
+        ],
+        "historical_stats": {
+            "avg_move": "120 pips celý event",
+            "priced_in_rate": "75% času",
+            "powell_reversal": "43% (často řekne opak očekávání)"
+        }
+    },
+    "ECB": {
+        "full_name": "ECB Interest Rate Decision",
+        "impact": "⚡⚡ HIGH",
+        "description": "Evropská centrální banka mění sazby - hlavní driver pro EUR",
+        "typical_move": "30-80 pips statement, 40-100 pips Lagarde speech",
+        "affects": ["EUR/*", "European stocks"],
+        "strategies": {
+            "Before": "🔍 Sleduj ECB members comments týden před - často leaked",
+            "13:45 CET": "⏸️ Počkej 5 min - initial spike často reverses",
+            "14:30 CET": "🎤 Lagarde press conference - obchoduj její tone",
+            "After": "📈 Trend často pokračuje 1-2 dny po eventu"
+        },
+        "watch_out": [
+            "ECB často 'behind the curve' - pomalé na změny",
+            "Forward guidance vágní → volatilita vyšší",
+            "EUR/USD často priced-in → obchoduj EUR/GBP místo toho",
+            "Lagarde může být dovish i při rate hike"
+        ],
+        "historical_stats": {
+            "avg_move": "65 pips",
+            "lagarde_surprise": "38%"
+        }
+    },
+    "CPI": {
+        "full_name": "Consumer Price Index (Inflation)",
+        "impact": "⚡⚡⚡ EXTREME",
+        "description": "Měsíční inflační data - určuje směr měnové politiky",
+        "typical_move": "40-120 pips",
+        "affects": ["USD/*", "Bonds", "Gold"],
+        "strategies": {
+            "Before": "🎯 Range breakout setup - inflation surprise = big move",
+            "08:30 EST": "⚡ Immediate spike - pokud překvapení 0.2%+ obchoduj momentum",
+            "After 15min": "📊 Fade pokud overextended, nebo hold pokud clear trend"
+        },
+        "watch_out": [
+            "Core CPI důležitější než headline",
+            "Fed sleduje 'supercore' (services ex-housing)",
+            "High CPI = rate hikes expected = USD up (short-term)",
+            "Ale high inflation dlouhodobě = USD down"
+        ],
+        "historical_stats": {
+            "avg_move": "75 pips",
+            "surprise_0.3%+": "150+ pips"
+        }
+    },
+    "GDP": {
+        "full_name": "GDP Growth Rate",
+        "impact": "⚡⚡ HIGH",
+        "description": "Čtvrtletní růst ekonomiky",
+        "typical_move": "20-60 pips",
+        "affects": ["Local currency", "Stocks"],
+        "strategies": {
+            "Before": "⚠️ Lower impact než NFP/CPI - čekej confirmation",
+            "After": "📈 Obchoduj pokud beat/miss >0.5% expected"
+        },
+        "watch_out": [
+            "Často revised - první reading méně důležitý",
+            "Pokud priced-in → minimal reaction",
+            "Watch forward guidance víc než číslo samo"
+        ],
+        "historical_stats": {
+            "avg_move": "45 pips"
+        }
+    }
+}
 
 # ===== KONFIGURACE =====
 DEFAULT_PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "NZD/USD"]
@@ -99,51 +236,118 @@ TD_TO_YF = {
     "USD/CAD": "USDCAD=X", "AUD/USD": "AUDUSD=X", "NZD/USD": "NZDUSD=X"
 }
 
-# ===== NEWS CALENDAR =====
+# ===== COMMODITY PRICES =====
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_commodity_prices() -> Dict:
+    """Fetch live commodity prices"""
+    commodities = {
+        "CL=F": "WTI Crude",
+        "BZ=F": "Brent Oil", 
+        "GC=F": "Gold",
+        "HG=F": "Copper",
+        "NG=F": "Nat Gas",
+        "^GSPC": "S&P500",
+        "^VIX": "VIX"
+    }
+    
+    prices = {}
+    try:
+        for symbol, name in commodities.items():
+            try:
+                ticker = yf.Ticker(symbol)
+                hist = ticker.history(period="2d", interval="1h")
+                if not hist.empty:
+                    current = float(hist['Close'].iloc[-1])
+                    prev = float(hist['Close'].iloc[-2]) if len(hist) > 1 else current
+                    change_pct = ((current - prev) / prev) * 100 if prev != 0 else 0
+                    prices[name] = {
+                        "price": current,
+                        "change": change_pct,
+                        "symbol": symbol
+                    }
+            except:
+                continue
+    except:
+        pass
+    
+    return prices
+
+# ===== ENHANCED NEWS CALENDAR =====
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_economic_calendar() -> List[Dict]:
-    """Fetch upcoming economic events (mock data - can integrate real API)"""
-    # Mock high-impact news for demo
+    """Fetch upcoming economic events with enhanced details"""
     now = datetime.utcnow()
     events = [
-        {"time": now + timedelta(hours=2), "currency": "USD", "event": "NFP (Non-Farm Payrolls)", "impact": "HIGH"},
-        {"time": now + timedelta(hours=5), "currency": "EUR", "event": "ECB Interest Rate", "impact": "HIGH"},
-        {"time": now + timedelta(hours=8), "currency": "GBP", "event": "GDP Data", "impact": "MEDIUM"},
-        {"time": now + timedelta(days=1), "currency": "USD", "event": "FOMC Meeting", "impact": "HIGH"},
+        {
+            "time": now + timedelta(hours=2),
+            "currency": "USD", 
+            "event": "NFP",
+            "impact": "HIGH"
+        },
+        {
+            "time": now + timedelta(hours=5),
+            "currency": "EUR",
+            "event": "ECB",
+            "impact": "HIGH"
+        },
+        {
+            "time": now + timedelta(hours=8),
+            "currency": "GBP",
+            "event": "GDP",
+            "impact": "MEDIUM"
+        },
+        {
+            "time": now + timedelta(days=1),
+            "currency": "USD",
+            "event": "FOMC",
+            "impact": "HIGH"
+        },
+        {
+            "time": now + timedelta(hours=26),
+            "currency": "USD",
+            "event": "CPI",
+            "impact": "HIGH"
+        },
     ]
     return events
 
+def is_news_time(currency: str, events: List[Dict], buffer_minutes: int = 30) -> Optional[tuple]:
+    """Check if we're near news event and return (event, time_to_event_min)"""
+    now = datetime.utcnow()
+    for event in events:
+        if event["impact"] != "HIGH":
+            continue
+        event_currencies = event.get("currency", "")
+        if any(curr in currency for curr in ["EUR", "USD", "GBP", "JPY", "CAD", "AUD", "NZD"]):
+            time_to_event = (event["time"] - now).total_seconds() / 60
+            if -buffer_minutes <= time_to_event <= buffer_minutes:
+                return (event, int(time_to_event))
+    return None
+
 # ===== NEWS TRADING STRATEGIES =====
 def signal_news_breakout(df: pd.DataFrame, news_event: Dict, params: Dict) -> Optional[Dict]:
-    """Pre-news breakout setup - straddle strategy"""
+    """Pre-news breakout setup"""
     if len(df) < 20:
         return None
     try:
-        # Calculate recent range (20 candles)
         recent = df.iloc[-20:]
         high_range = recent["High"].max()
         low_range = recent["Low"].min()
-        mid_range = (high_range + low_range) / 2
         range_size = high_range - low_range
         
         last = df.iloc[-1]
         close = float(last["Close"])
         atr_val = float(last["ATR"])
         
-        # Check if we're in tight range before news (consolidation)
         if range_size < 2.5 * atr_val:
-            # Setup breakout trades
-            entry_buy = high_range + 0.0005  # Breakout above
-            entry_sell = low_range - 0.0005  # Breakout below
+            entry_buy = high_range + 0.0005
+            entry_sell = low_range - 0.0005
+            sl_distance = atr_val * 2.0
             
-            sl_distance = atr_val * 2.0  # Wider stops for news
-            
-            # Prefer direction based on pre-news trend
             ema20 = float(last["EMA20"])
             ema50 = float(last["EMA50"])
             
             if ema20 > ema50:
-                # Bullish bias
                 return {
                     "type": "BUY",
                     "entry": entry_buy,
@@ -155,7 +359,6 @@ def signal_news_breakout(df: pd.DataFrame, news_event: Dict, params: Dict) -> Op
                     "news_trade": True
                 }
             else:
-                # Bearish bias
                 return {
                     "type": "SELL",
                     "entry": entry_sell,
@@ -171,22 +374,20 @@ def signal_news_breakout(df: pd.DataFrame, news_event: Dict, params: Dict) -> Op
     return None
 
 def signal_news_momentum(df: pd.DataFrame, news_event: Dict, params: Dict) -> Optional[Dict]:
-    """Post-news momentum - ride the wave after initial move"""
+    """Post-news momentum"""
     if len(df) < 10:
         return None
     try:
         last = df.iloc[-1]
-        prev_5 = df.iloc[-6:-1]  # Last 5 candles before current
+        prev_5 = df.iloc[-6:-1]
         
         close = float(last["Close"])
         atr_val = float(last["ATR"])
         rsi_val = float(last["RSI"])
         
-        # Check if there was strong momentum in last 5 candles
         momentum_up = (close - prev_5["Close"].iloc[0]) / prev_5["Close"].iloc[0]
         
-        # Strong upward momentum after news
-        if momentum_up > 0.003 and rsi_val < 75:  # 0.3%+ move, not overbought
+        if momentum_up > 0.003 and rsi_val < 75:
             return {
                 "type": "BUY",
                 "entry": close,
@@ -197,8 +398,6 @@ def signal_news_momentum(df: pd.DataFrame, news_event: Dict, params: Dict) -> Op
                 "rr": 1.5,
                 "news_trade": True
             }
-        
-        # Strong downward momentum after news
         elif momentum_up < -0.003 and rsi_val > 25:
             return {
                 "type": "SELL",
@@ -215,7 +414,7 @@ def signal_news_momentum(df: pd.DataFrame, news_event: Dict, params: Dict) -> Op
     return None
 
 def signal_news_fade(df: pd.DataFrame, news_event: Dict, params: Dict) -> Optional[Dict]:
-    """Fade overreaction - counter-trend after extreme spike"""
+    """Fade overreaction"""
     if len(df) < 10:
         return None
     try:
@@ -227,23 +426,19 @@ def signal_news_fade(df: pd.DataFrame, news_event: Dict, params: Dict) -> Option
         rsi_val = float(last["RSI"])
         vwap_val = float(last["VWAP"])
         
-        # Quick spike in last 3 candles
         spike = (close - prev_3["Close"].iloc[0]) / prev_3["Close"].iloc[0]
         
-        # Overextended up - fade it
         if spike > 0.005 and rsi_val > 75 and close > vwap_val * 1.003:
             return {
                 "type": "SELL",
                 "entry": close,
                 "sl": close + (atr_val * 1.5),
-                "tp": vwap_val,  # Back to VWAP
+                "tp": vwap_val,
                 "confidence": 65,
                 "reason": f"🔄 FADE OVERREACTION: {news_event['event']} (RSI={rsi_val:.0f})",
                 "rr": abs((vwap_val - close) / (atr_val * 1.5)) if atr_val > 0 else 1.0,
                 "news_trade": True
             }
-        
-        # Overextended down - fade it
         elif spike < -0.005 and rsi_val < 25 and close < vwap_val * 0.997:
             return {
                 "type": "BUY",
@@ -260,15 +455,12 @@ def signal_news_fade(df: pd.DataFrame, news_event: Dict, params: Dict) -> Option
     return None
 
 def build_news_signal(df: pd.DataFrame, news_event: Dict, params: Dict, time_to_news_min: int) -> Optional[Dict]:
-    """Determine best news trading strategy based on timing"""
+    """Determine best news trading strategy"""
     if time_to_news_min > 15:
-        # More than 15min before news - setup breakout
         return signal_news_breakout(df, news_event, params)
     elif 0 <= time_to_news_min <= 15:
-        # During news window - wait for momentum
         return signal_news_momentum(df, news_event, params)
     elif -15 <= time_to_news_min < 0:
-        # Up to 15min after news - momentum or fade
         momentum_sig = signal_news_momentum(df, news_event, params)
         if momentum_sig:
             return momentum_sig
@@ -331,7 +523,6 @@ def vwap(df: pd.DataFrame) -> pd.Series:
     return cum_pv / cum_vol
 
 def calculate_market_sentiment(df: pd.DataFrame) -> str:
-    """Calculate simple market sentiment based on technicals"""
     if len(df) < 50:
         return "NEUTRAL"
     last = df.iloc[-1]
@@ -361,7 +552,7 @@ def send_telegram_notification(bot_token: str, chat_id: str, signal: Dict, symbo
             f"🛑 <b>Stop Loss:</b> {signal['sl']:.5f}\n"
             f"🎯 <b>Take Profit:</b> {signal['tp']:.5f}\n"
             f"📊 <b>R:R:</b> {signal.get('rr', 0):.2f}\n"
-            f"✅ <b>Důvěra:</b> {signal['confidence']}%\n\n"
+            f"✅ <b>Confidence:</b> {signal['confidence']}%\n\n"
             f"📝 <i>{signal['reason']}</i>\n\n"
             f"🕐 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
         )
@@ -502,7 +693,7 @@ def calculate_position_size(account: float, risk: float, entry: float, sl: float
     return {"lot_size": round(max(0.01, lot_size), 2), "risk_amount": round(risk_amount, 2), "pips": round(pips, 1)}
 
 # ===== MAIN UI =====
-st.markdown("<h1>🚀 Trading Copilot Pro</h1>", unsafe_allow_html=True)
+st.markdown("<h1>🚀 Trading Copilot Pro - Market Intelligence</h1>", unsafe_allow_html=True)
 
 # ===== SIDEBAR =====
 with st.sidebar:
@@ -511,7 +702,7 @@ with st.sidebar:
     with st.expander("🔌 Data Source", expanded=True):
         use_twelvedata = st.checkbox("Twelve Data API", value=False)
         if use_twelvedata:
-            twelvedata_api_key = st.text_input("API Key", type="password", placeholder="your_key_here")
+            twelvedata_api_key = st.text_input("API Key", type="password")
         else:
             twelvedata_api_key = ""
             st.caption("Using yfinance (~5min delay)")
@@ -535,16 +726,13 @@ with st.sidebar:
         news_mode = st.radio(
             "Mode",
             ["🛡️ Safe (Block during news)", "💰 Aggressive (Trade the news)"],
-            index=0,
-            help="Safe: Avoid trading during news | Aggressive: Generate signals based on news volatility"
+            index=0
         )
-        news_buffer = st.slider("Time Window (min)", 15, 60, 30, 
-                               help="Minutes before/after news to apply strategy")
+        news_buffer = st.slider("Time Window (min)", 15, 60, 30)
         
         if news_mode == "💰 Aggressive (Trade the news)":
-            st.warning("⚠️ **HIGH RISK MODE**\n\nNews trading requires:\n- Wider stops\n- Fast execution\n- Strong nerves\n- Experience")
-            news_risk_multiplier = st.slider("Risk Multiplier", 1.0, 3.0, 1.5, 0.5,
-                                            help="Multiply normal risk (1.5x = 1.5% instead of 1%)")
+            st.warning("⚠️ **HIGH RISK MODE**")
+            news_risk_multiplier = st.slider("Risk Multiplier", 1.0, 3.0, 1.5, 0.5)
         else:
             news_risk_multiplier = 1.0
     
@@ -556,11 +744,6 @@ with st.sidebar:
         if enable_telegram:
             telegram_token = st.text_input("Bot Token", type="password")
             telegram_chat = st.text_input("Chat ID")
-            if telegram_token and telegram_chat and telegram_chat.lstrip('-').isdigit():
-                if st.button("🧪 Test", use_container_width=True):
-                    test_sig = {"type": "BUY", "entry": 1.085, "sl": 1.082, "tp": 1.09, "confidence": 75, "reason": "Test", "rr": 1.67}
-                    if send_telegram_notification(telegram_token, telegram_chat, test_sig, "TEST"):
-                        st.success("✅ Working!")
         else:
             telegram_token = ""
             telegram_chat = ""
@@ -589,92 +772,133 @@ if "journal" not in st.session_state:
 if "notified" not in st.session_state:
     st.session_state.notified = set()
 
-# ===== STATUS BAR =====
-data_source = "🟢 Twelve Data" if (use_twelvedata and twelvedata_api_key) else "🟡 yfinance"
-telegram_active = enable_telegram and telegram_token and telegram_chat and telegram_chat.lstrip('-').isdigit()
-is_aggressive_mode = news_mode == "💰 Aggressive (Trade the news)"
-news_status = "💰 NEWS TRADING" if is_aggressive_mode else "🛡️ NEWS FILTER"
+# ===== COMMODITY PRICES =====
+commodity_prices = fetch_commodity_prices()
 
+# ===== STATUS BAR =====
 col1, col2, col3, col4 = st.columns(4)
 with col1:
+    data_source = "🟢 Twelve Data" if (use_twelvedata and twelvedata_api_key) else "🟡 yfinance"
     st.metric("Data Source", data_source)
 with col2:
-    st.metric("Mode", "⚡ AGGRESSIVE" if is_aggressive_mode else "🛡️ SAFE", 
-             delta="High Risk" if is_aggressive_mode else "Protected")
+    is_aggressive = news_mode == "💰 Aggressive (Trade the news)"
+    st.metric("Mode", "⚡ AGGRESSIVE" if is_aggressive else "🛡️ SAFE")
 with col3:
+    telegram_active = enable_telegram and telegram_token and telegram_chat and telegram_chat.lstrip('-').isdigit()
     st.metric("Telegram", "🔔 ON" if telegram_active else "🔕 OFF")
 with col4:
-    st.metric("Risk/Trade", f"{risk_per_trade * news_risk_multiplier:.1f}%" if is_aggressive_mode else f"{risk_per_trade:.1f}%")
+    st.metric("Risk/Trade", f"{risk_per_trade * news_risk_multiplier:.1f}%")
 
-# ===== NEWS CALENDAR =====
-if True:  # Always show news calendar
-    with st.expander("📰 Upcoming High-Impact News & Strategy", expanded=is_aggressive_mode):
-        events = fetch_economic_calendar()
-        if events:
-            st.markdown("**Next 24 hours:**")
-            for event in events[:5]:
+st.markdown("---")
+
+# ===== COMMODITY & CORRELATION DASHBOARD =====
+st.markdown("### 🌍 Market Correlations & Live Prices")
+
+col_left, col_right = st.columns([1, 1])
+
+with col_left:
+    st.markdown("#### 📊 Key Markets")
+    if commodity_prices:
+        for name, data in commodity_prices.items():
+            price = data['price']
+            change = data['change']
+            color = "🟢" if change > 0 else "🔴" if change < 0 else "⚪"
+            
+            if name in ["WTI Crude", "Brent Oil"]:
+                st.markdown(f"""
+                <div class='commodity-card'>
+                    {color} <b>{name}</b>: ${price:.2f} ({change:+.2f}%)
+                    <br><small>💡 Affects: USD/CAD, CAD/JPY (inverse)</small>
+                </div>
+                """, unsafe_allow_html=True)
+            elif name == "Gold":
+                st.markdown(f"""
+                <div class='commodity-card'>
+                    {color} <b>{name}</b>: ${price:.2f} ({change:+.2f}%)
+                    <br><small>💡 Affects: AUD/USD, NZD/USD (direct)</small>
+                </div>
+                """, unsafe_allow_html=True)
+            elif name == "S&P500":
+                st.markdown(f"""
+                <div class='commodity-card'>
+                    {color} <b>{name}</b>: {price:.2f} ({change:+.2f}%)
+                    <br><small>💡 Risk-on: AUD/NZD up, JPY down</small>
+                </div>
+                """, unsafe_allow_html=True)
+            elif name == "VIX":
+                st.markdown(f"""
+                <div class='commodity-card'>
+                    {color} <b>{name}</b>: {price:.2f} ({change:+.2f}%)
+                    <br><small>💡 Fear gauge: High VIX = JPY/USD up</small>
+                </div>
+                """, unsafe_allow_html=True)
+
+with col_right:
+    st.markdown("#### 🔗 Your Pairs Correlations")
+    for pair in pairs[:3]:
+        if pair in MARKET_CORRELATIONS:
+            corr = MARKET_CORRELATIONS[pair]
+            st.markdown(f"**{pair}**")
+            st.caption(corr['description'])
+            
+            for comm_name, comm_data in corr['commodities'].items():
+                strength = comm_data['strength']
+                correlation = comm_data['correlation']
+                
+                strength_emoji = "🔥" if strength == "VERY STRONG" else "⚡" if strength == "STRONG" else "💫"
+                corr_text = "↑↑" if correlation == "DIRECT" else "↓↑" if correlation == "INVERSE" else "~"
+                
+                st.markdown(f"{strength_emoji} {comm_name} {corr_text} ({strength})")
+
+st.markdown("---")
+
+# ===== ENHANCED NEWS CALENDAR =====
+with st.expander("📰 ECONOMIC CALENDAR - Next 48 Hours", expanded=True):
+    events = fetch_economic_calendar()
+    
+    if events:
+        for event in events[:5]:
+            event_key = event['event']
+            if event_key in NEWS_DATABASE:
+                news_info = NEWS_DATABASE[event_key]
+                
                 time_to = event["time"] - datetime.utcnow()
                 hours = int(time_to.total_seconds() / 3600)
                 minutes = int((time_to.total_seconds() % 3600) / 60)
-                impact_color = "🔴" if event["impact"] == "HIGH" else "🟡"
                 time_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
-                st.caption(f"{impact_color} **{event['event']}** ({event['currency']}) - in {time_str}")
-            
-            st.markdown("---")
-            
-            if is_aggressive_mode:
-                st.error("""
-                ### 💰 AGGRESSIVE MODE - News Trading Strategies
                 
-                **3 Strategies Active:**
+                st.markdown(f"### {news_info['impact']} {news_info['full_name']}")
+                st.markdown(f"**⏰ In {time_str}** | Currency: {event['currency']}")
                 
-                🔥 **Breakout Setup** (15-60min before news):
-                - Identifies tight range consolidation
-                - Sets pending orders above/below range
-                - Catches explosive breakout
-                - R:R: 2.5:1 | Stop: 2x ATR
+                col1, col2 = st.columns([1, 1])
                 
-                ⚡ **Momentum Ride** (0-15min after news):
-                - Waits for initial spike
-                - Enters in direction of move
-                - Rides the wave
-                - R:R: 1.5:1 | Stop: 2x ATR
+                with col1:
+                    st.markdown(f"""
+                    **📖 What is it?**  
+                    {news_info['description']}
+                    
+                    **📊 Expected Move:**  
+                    {news_info['typical_move']}
+                    
+                    **🎯 Affects:**  
+                    {', '.join(news_info['affects'])}
+                    """)
                 
-                🔄 **Fade Overreaction** (5-15min after):
-                - Detects overextended moves (RSI>75 or <25)
-                - Counter-trend back to VWAP
-                - Mean reversion play
-                - R:R: Variable | Target: VWAP
+                with col2:
+                    st.markdown("**💡 TRADING STRATEGIES:**")
+                    for timing, strategy in news_info['strategies'].items():
+                        st.markdown(f"- **{timing}:** {strategy}")
                 
-                ⚠️ **Risks:**
-                - Wider spreads (5-10 pips)
-                - Slippage (2-5 pips)
-                - Fast reversals
-                - Requires INSTANT execution
+                if 'watch_out' in news_info:
+                    st.warning("**⚠️ Watch Out:**\n" + "\n".join([f"- {item}" for item in news_info['watch_out']]))
                 
-                💡 **Best For:** NFP, FOMC, ECB, GDP, CPI
-                """)
-            else:
-                st.success("""
-                ### 🛡️ SAFE MODE - News Protection
+                if 'historical_stats' in news_info:
+                    stats = news_info['historical_stats']
+                    st.info(f"📈 **Historical Data:** " + " | ".join([f"{k}: {v}" for k, v in stats.items()]))
                 
-                **What happens:**
-                - All signals BLOCKED 30min before/after high-impact news
-                - Protects you from volatile whipsaws
-                - Reduces false breakouts by 70%
-                - Increases overall win rate by 15-20%
-                
-                **Why avoid news?**
-                - Spreads widen 5-10x
-                - Slippage 5-20 pips common
-                - Technical analysis fails
-                - Random spike direction
-                
-                💡 **Want to trade news?** Switch to Aggressive Mode!
-                ⚠️ Only for experienced traders with fast execution!
-                """)
-        else:
-            st.info("No major news scheduled in next 24 hours.")
+                st.markdown("---")
+    else:
+        st.info("No major news in next 48 hours")
 
 st.markdown("---")
 
@@ -706,13 +930,10 @@ with st.spinner("🔄 Loading market data..."):
             from_vwap = float(last["FromVWAP"])
             close = float(last["Close"])
             
-            # Market sentiment
             sentiment = calculate_market_sentiment(df)
             sentiment_emoji = "🟢" if sentiment == "BULLISH" else "🔴" if sentiment == "BEARISH" else "🟡"
-            
             trend = "📈" if ema20 >= ema50 else "📉"
             
-            # Check news timing
             currency = sym.split("/")[0]
             news_check = is_news_time(currency, economic_events, news_buffer)
             
@@ -723,32 +944,27 @@ with st.spinner("🔄 Loading market data..."):
             if news_check:
                 news_event, time_to_news = news_check
                 
-                if is_aggressive_mode:
-                    # AGGRESSIVE MODE: Generate news trading signals
+                if is_aggressive:
                     sig = build_news_signal(df, news_event, params, time_to_news)
                     
                     if sig and sig["confidence"] >= min_confidence:
                         signal_txt = f"🔥 {sig['type']}"
                         conf = f"{sig['confidence']}%"
                         
-                        # Send Telegram with higher risk warning
                         sig_key = f"{sym}_{sig['type']}_{sig['entry']:.5f}_NEWS"
                         if telegram_active and sig_key not in st.session_state.notified:
                             if send_telegram_notification(telegram_token, telegram_chat, sig, sym):
                                 st.session_state.notified.add(sig_key)
                 else:
-                    # SAFE MODE: Block signals during news
                     signal_txt = f"⚠️ NEWS BLOCK"
                     conf = "—"
             else:
-                # No news - normal signals
                 sig = build_signal(df, params)
                 
                 if sig and sig["confidence"] >= min_confidence:
                     signal_txt = f"{'🟢' if sig['type']=='BUY' else '🔴'} {sig['type']}"
                     conf = f"{sig['confidence']}%"
                     
-                    # Send Telegram
                     sig_key = f"{sym}_{sig['type']}_{sig['entry']:.5f}"
                     if telegram_active and sig_key not in st.session_state.notified:
                         if send_telegram_notification(telegram_token, telegram_chat, sig, sym):
@@ -756,7 +972,7 @@ with st.spinner("🔄 Loading market data..."):
             
             price_fmt = f"{close:.5f}" if ("JPY" not in sym and "/JPY" not in sym) else f"{close:.3f}"
             rows.append([sym, f"{sentiment_emoji} {sentiment}", trend, f"{rsi_val:.0f}", pct(from_vwap), price_fmt, signal_txt, conf])
-        except Exception as e:
+        except:
             rows.append([sym, "—", "—", "—", "—", "—", "—", "—"])
 
 # ===== MARKET OVERVIEW =====
@@ -776,15 +992,24 @@ with col_left:
         sel = st.selectbox("📌 Select Pair", pairs, index=0)
         df = charts_data.get(sel, pd.DataFrame())
         
+        # Show correlation info
+        if sel in MARKET_CORRELATIONS:
+            st.info(f"**📊 {sel} Correlations:**\n\n{MARKET_CORRELATIONS[sel]['description']}")
+        
         if not df.empty and len(df) >= 60:
+            currency = sel.split("/")[0]
+            news_check = is_news_time(currency, economic_events, news_buffer)
+            
+            if news_check:
+                news_event, time_to = news_check
+                event_key = news_event['event']
+                if event_key in NEWS_DATABASE:
+                    st.warning(f"⚠️ **{NEWS_DATABASE[event_key]['full_name']}** in {abs(time_to)} min!")
+            
             sig = build_signal(df, params)
             
-            # Check news
-            currency = sel.split("/")[0]
-            news_event = is_news_time(currency, economic_events, news_buffer) if enable_news_filter else None
-            
-            if news_event:
-                st.warning(f"⚠️ **NEWS ALERT**\n\n{news_event['event']} in {int((news_event['time'] - datetime.utcnow()).total_seconds() / 60)} min\n\nSignals disabled for safety!")
+            if news_check and not is_aggressive:
+                st.warning(f"🛡️ **SAFE MODE** - Signals blocked")
             elif sig and sig["confidence"] >= min_confidence:
                 pos = calculate_position_size(account_balance, risk_per_trade, sig["entry"], sig["sl"], sel)
                 emoji = "🟢" if sig["type"] == "BUY" else "🔴"
@@ -792,37 +1017,34 @@ with col_left:
                 st.success(f"""
                 ### {emoji} {sig['type']} SIGNAL
                 
-                **📊 Trade Details:**
+                **📊 Trade:**
                 - Entry: `{sig['entry']:.5f}`
-                - Stop Loss: `{sig['sl']:.5f}`
-                - Take Profit: `{sig['tp']:.5f}`
-                - R:R Ratio: `{sig['rr']:.2f}`
-                - Confidence: `{sig['confidence']}%`
+                - SL: `{sig['sl']:.5f}`
+                - TP: `{sig['tp']:.5f}`
+                - R:R: `{sig['rr']:.2f}`
+                - Conf: `{sig['confidence']}%`
                 
-                **💰 Position Sizing:**
-                - Lot Size: `{pos['lot_size']} lots`
-                - Risk: `${pos['risk_amount']}` ({risk_per_trade}%)
-                - SL Distance: `{pos['pips']} pips`
+                **💰 Position:**
+                - Lot: `{pos['lot_size']}`
+                - Risk: `${pos['risk_amount']}`
                 
-                **📝 Reason:** {sig['reason']}
+                **📝** {sig['reason']}
                 """)
                 
                 col1, col2 = st.columns(2)
                 with col1:
-                    if st.button("✅ Take Trade", use_container_width=True, type="primary"):
+                    if st.button("✅ Take", type="primary", use_container_width=True):
                         st.session_state.journal.append({
                             "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                             "pair": sel, "type": sig["type"], "entry": sig["entry"],
                             "sl": sig["sl"], "tp": sig["tp"], "lots": pos["lot_size"],
                             "risk": pos["risk_amount"], "conf": sig["confidence"]
                         })
-                        st.success("✅ Added to journal!")
+                        st.success("✅ Added!")
                 with col2:
                     st.button("⏭ Skip", use_container_width=True)
             else:
-                st.info("😴 No strong signals currently")
-        else:
-            st.info("📊 Loading data...")
+                st.info("😴 No signals")
 
 with col_right:
     if pairs and sel in charts_data:
@@ -830,12 +1052,10 @@ with col_right:
         if not df.empty and len(df) > 60:
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
             
-            # Candlesticks
             fig.add_trace(go.Candlestick(x=df["Datetime"], open=df["Open"], high=df["High"],
                                        low=df["Low"], close=df["Close"], showlegend=False,
                                        increasing_line_color='#22c55e', decreasing_line_color='#ef4444'), row=1, col=1)
             
-            # Indicators
             fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA20"], name="EMA20", 
                                    line=dict(color='#06b6d4', width=2)), row=1, col=1)
             fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA50"], name="EMA50",
@@ -843,13 +1063,10 @@ with col_right:
             fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], name="VWAP",
                                    line=dict(dash="dot", color='#eab308', width=2)), row=1, col=1)
             
-            # RSI
             fig.add_trace(go.Scatter(x=df["Datetime"], y=df["RSI"], name="RSI",
                                    line=dict(color='#a855f7', width=2)), row=2, col=1)
             fig.add_hrect(y0=70, y1=100, line_width=0, fillcolor="rgba(239, 68, 68, 0.1)", row=2)
             fig.add_hrect(y0=0, y1=30, line_width=0, fillcolor="rgba(34, 197, 94, 0.1)", row=2)
-            fig.add_hline(y=70, line_dash="dash", line_color="#ef4444", opacity=0.5, row=2)
-            fig.add_hline(y=30, line_dash="dash", line_color="#22c55e", opacity=0.5, row=2)
             
             fig.update_layout(
                 height=650,
@@ -872,16 +1089,11 @@ st.markdown("### 📖 Trading Journal")
 if st.session_state.journal:
     jdf = pd.DataFrame(st.session_state.journal)
     
-    # Count news trades
-    news_trades = len([t for t in st.session_state.journal if t.get("note", "").startswith("NEWS")])
-    normal_trades = len(jdf) - news_trades
-    
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("📊 Total", len(jdf))
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("📊 Trades", len(jdf))
     col2.metric("💰 Risk", f"${jdf['risk'].sum():.2f}")
-    col3.metric("📈 Avg Conf", f"{jdf['conf'].mean():.0f}%")
-    col4.metric("🔥 News Trades", news_trades, delta="High Risk" if news_trades > 0 else None)
-    col5.metric("📱 Telegram", len(st.session_state.notified))
+    col3.metric("📈 Conf", f"{jdf['conf'].mean():.0f}%")
+    col4.metric("📱 Alerts", len(st.session_state.notified))
     
     st.dataframe(jdf, use_container_width=True, height=350)
     
@@ -892,36 +1104,10 @@ if st.session_state.journal:
             st.rerun()
     with col2:
         csv = jdf.to_csv(index=False).encode("utf-8")
-        st.download_button("💾 Export CSV", data=csv, file_name=f"journal_{datetime.now().strftime('%Y%m%d')}.csv",
+        st.download_button("💾 Export", data=csv, file_name=f"journal_{datetime.now().strftime('%Y%m%d')}.csv",
                           mime="text/csv", use_container_width=True)
 else:
-    st.info(f"""
-    📝 Your trading journal is empty. 
-    
-    {'🔥 **Aggressive Mode:** Signals will appear when high-impact news approaches!' if is_aggressive_mode else '🛡️ **Safe Mode:** Start by taking a trade when you see a strong signal outside news times!'}
-    """)
+    st.info("📝 Journal empty")
 
 st.markdown("---")
-
-if is_aggressive_mode:
-    st.error("""
-    ⚠️ **HIGH RISK WARNING - News Trading Mode Active**
-    
-    News trading carries EXTREME risk:
-    - Spreads can widen 500-1000%
-    - Slippage of 10-50 pips is common
-    - Stop losses may not execute at desired price
-    - Requotes and rejected orders frequent
-    - Can wipe account in single trade
-    
-    **Only use if:**
-    - You have 2+ years trading experience
-    - Fast broker with instant execution
-    - Can handle 5-10% swings
-    - Understand market microstructure
-    - Have tested strategy extensively
-    
-    **This tool is for EDUCATION only. Not financial advice.**
-    """)
-else:
-    st.caption("⚠️ **Disclaimer:** For educational purposes only. Not financial advice. Trading involves risk.")
+st.caption("⚠️ **Educational purposes only. Not financial advice.**")
