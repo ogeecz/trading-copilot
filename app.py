@@ -1,6 +1,5 @@
 import time
 from datetime import datetime, timedelta, timezone
-
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -34,14 +33,13 @@ def atr(df: pd.DataFrame, window: int = 14):
     return tr.rolling(window).mean()
 
 def vwap(df: pd.DataFrame):
-    # FX nemívá volume -> použijeme „proxy volume“: range jako váhu
     vol = (df["High"] - df["Low"]).replace(0, np.nan).fillna(method="ffill").fillna(1.0)
     tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
     cum_vol = vol.cumsum()
     cum_pv = (tp * vol).cumsum()
     return cum_pv / cum_vol
 
-def pct(x):  # formátování
+def pct(x):
     return f"{x*100:.2f}%"
 
 # -------------------------
@@ -66,7 +64,6 @@ def load_intraday(symbol: str, interval: str = "5m", lookback_days: int = 7) -> 
     if df.empty:
         return df
     df = df.rename_axis("Datetime").reset_index()
-    # yfinance vrací timezone-aware; sjednotíme na UTC a locale-friendly
     if hasattr(df["Datetime"].iloc[0], "tzinfo") and df["Datetime"].dt.tz is not None:
         df["Datetime"] = df["Datetime"].dt.tz_convert("UTC").dt.tz_localize(None)
     return df
@@ -88,7 +85,6 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
 # Signály
 # -------------------------
 def signal_mean_reversion(df: pd.DataFrame):
-    """LONG: cena pod VWAP o >= 0.15 %, RSI < 30, trend ne proti (EMA20>=EMA50)"""
     row = df.iloc[-1]
     cond = (row["FromVWAP"] <= -0.0015) and (row["RSI"] < 30) and (row["EMA20"] >= row["EMA50"])
     if not cond:
@@ -101,12 +97,10 @@ def signal_mean_reversion(df: pd.DataFrame):
             "reason": "MR→VWAP (RSI<30, pod VWAP, EMA20≥EMA50)"}
 
 def signal_vwap_breakout(df: pd.DataFrame):
-    """LONG/SHORT dle průrazu VWAP + RSI 50–65 (long) nebo 35–50 (short) + trend"""
     last = df.iloc[-1]
     prev = df.iloc[-2]
     sig = None
 
-    # LONG breakout
     if (prev["Close"] <= prev["VWAP"]) and (last["Close"] > last["VWAP"]) and (50 <= last["RSI"] <= 65) and (last["EMA20"] > last["EMA50"]):
         entry = float(last["Close"])
         risk = 1.2 * float(last["ATR"])
@@ -116,7 +110,6 @@ def signal_vwap_breakout(df: pd.DataFrame):
                "confidence": 55 + min(25, int((last["RSI"] - 50) * 2)),
                "reason": "VWAP breakout ↑ (RSI 50–65, EMA20>EMA50)"}
 
-    # SHORT breakout
     if (prev["Close"] >= prev["VWAP"]) and (last["Close"] < last["VWAP"]) and (35 <= last["RSI"] <= 50) and (last["EMA20"] < last["EMA50"]):
         entry = float(last["Close"])
         risk = 1.2 * float(last["ATR"])
@@ -131,7 +124,6 @@ def signal_vwap_breakout(df: pd.DataFrame):
 def build_signal(df: pd.DataFrame):
     if df.shape[0] < 60:
         return None
-    # priorita: mean-reversion > breakout
     sig = signal_mean_reversion(df)
     if sig is None:
         sig = signal_vwap_breakout(df)
@@ -142,10 +134,7 @@ def build_signal(df: pd.DataFrame):
 # -------------------------
 st.set_page_config(page_title="Trading Copilot (FX)", layout="wide", initial_sidebar_state="collapsed")
 
-st.markdown(
-    "<h2 style='margin-top:0'>Trading Copilot — FX signály (paper)</h2>",
-    unsafe_allow_html=True
-)
+st.markdown("<h2 style='margin-top:0'>Trading Copilot — FX signály (paper)</h2>", unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown("### Nastavení")
@@ -154,28 +143,30 @@ with st.sidebar:
     lookback = st.slider("Lookback (dní)", 3, 30, 7)
     autorefresh = st.selectbox("Auto-refresh", ["Vypnuto", "30 s", "60 s", "120 s"], index=2)
 
-# jednoduchý deník v session state
+# --- Auto-refresh (nová verze) ---
+AUTO_REFRESH_MS = {"Vypnuto": 0, "30 s": 30000, "60 s": 60000, "120 s": 120000}
+refresh_ms = AUTO_REFRESH_MS.get(autorefresh, 0)
+
+if refresh_ms > 0:
+    try:
+        st.query_params.update({"_": str(int(time.time()))})
+    except Exception:
+        pass
+
+    import threading
+    def _ref():
+        time.sleep(refresh_ms / 1000.0)
+        st.rerun()
+    threading.Thread(target=_ref, daemon=True).start()
+
+# -------------------------
+# Data & hlavní logika
+# -------------------------
 if "journal" not in st.session_state:
     st.session_state.journal = []
 
-if map_refresh[autorefresh]:
-    # Nový způsob – změní URL parametr, aby se obnovila cache
-    st.query_params.update({"_": str(int(time.time()))})
-    # Místo autorefresh použij rerun se sleepem (jednoduchý hack)
-    import threading
+st.caption(f"Data: yfinance • Interval: {interval} • Poslední aktualizace: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
 
-    def refresher(wait):
-        time.sleep(wait)
-        st.rerun()
-
-    threading.Thread(target=refresher, args=(map_refresh[autorefresh] / 1000,)).start()
-
-
-cols = st.columns([1.2, 1.0])
-with cols[0]:
-    st.caption(f"Data: yfinance • Interval: {interval} • Poslední aktualizace: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
-
-# Watchlist tabulka
 rows = []
 charts_data = {}
 for sym in pairs:
@@ -189,34 +180,24 @@ for sym in pairs:
     sig = build_signal(df)
     signal_txt = sig["type"] if sig else "Neutral"
     conf = f"{sig['confidence']}%" if sig else "—"
-    rows.append([
-        sym,
-        trend,
-        f"{last['RSI']:.0f}",
-        pct(last["FromVWAP"]),
-        f"{last['Close']:.5f}" if 'JPY' not in sym else f"{last['Close']:.3f}",
-        signal_txt,
-        conf
-    ])
+    rows.append([sym, trend, f"{last['RSI']:.0f}", pct(last["FromVWAP"]),
+                 f"{last['Close']:.5f}" if 'JPY' not in sym else f"{last['Close']:.3f}",
+                 signal_txt, conf])
 
 watch_df = pd.DataFrame(rows, columns=["Symbol", "Trend", "RSI", "Od VWAP", "Cena", "Signál", "Důvěra"])
 st.dataframe(watch_df, use_container_width=True, height=220)
 
-# Detaily & graf
 left, right = st.columns([1.05, 1.2])
-
 with left:
     sym = st.selectbox("Detail páru", pairs, index=0)
     df = charts_data[sym]
     if not df.empty:
         sig = build_signal(df)
         if sig:
-            st.success(
-                f"{sym} • {sig['type']} • Entry {sig['entry']:.5f} • SL {sig['sl']:.5f} • TP {sig['tp']:.5f} "
-                f"• Důvěra {sig['confidence']}%  \n_{sig['reason']}_"
-            )
+            st.success(f"{sym} • {sig['type']} • Entry {sig['entry']:.5f} • SL {sig['sl']:.5f} • TP {sig['tp']:.5f} "
+                       f"• Důvěra {sig['confidence']}%  \n_{sig['reason']}_")
             c1, c2, c3 = st.columns(3)
-            with c1: 
+            with c1:
                 if st.button("✅ Vzal bych obchod", use_container_width=True):
                     st.session_state.journal.append({
                         "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
@@ -227,12 +208,14 @@ with left:
                         "tp": sig["tp"],
                         "note": sig["reason"],
                     })
-            with c2: st.button("⏭ Přeskočit", use_container_width=True)
-            with c3: st.download_button("⬇ Export deníku (CSV)", 
-                                        data=pd.DataFrame(st.session_state.journal).to_csv(index=False).encode("utf-8"),
-                                        file_name="journal.csv",
-                                        mime="text/csv",
-                                        use_container_width=True)
+            with c2:
+                st.button("⏭ Přeskočit", use_container_width=True)
+            with c3:
+                st.download_button("⬇ Export deníku (CSV)",
+                                   data=pd.DataFrame(st.session_state.journal).to_csv(index=False).encode("utf-8"),
+                                   file_name="journal.csv",
+                                   mime="text/csv",
+                                   use_container_width=True)
         else:
             st.info("Žádný silný signál pro vybraný pár.")
 
@@ -240,16 +223,14 @@ with right:
     df = charts_data.get(sym, pd.DataFrame())
     if not df.empty and df.shape[0] > 60:
         fig = go.Figure()
-        fig.add_trace(go.Candlestick(
-            x=df["Datetime"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-            name="Cena", showlegend=False))
+        fig.add_trace(go.Candlestick(x=df["Datetime"], open=df["Open"], high=df["High"],
+                                     low=df["Low"], close=df["Close"], name="Cena", showlegend=False))
         fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA20"], name="EMA20"))
         fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA50"], name="EMA50"))
         fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], name="VWAP", line=dict(dash="dot")))
         fig.update_layout(height=420, template="plotly_dark", margin=dict(l=10,r=10,t=10,b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-        # RSI panel (jednoduše jako druhý graf)
         fig2 = go.Figure()
         fig2.add_trace(go.Scatter(x=df["Datetime"], y=df["RSI"], name="RSI"))
         fig2.add_hrect(y0=30, y1=70, line_width=0, fillcolor="gray", opacity=0.1)
@@ -264,4 +245,3 @@ else:
     st.dataframe(journal_df, use_container_width=True, height=220)
 
 st.caption("Upozornění: Vzdělávací účely. Nejde o investiční doporučení. Data: yfinance (přibližně 5min).")
-
