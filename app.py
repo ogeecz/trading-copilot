@@ -7,6 +7,8 @@ from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
 from typing import Optional, Dict
+import requests
+import json
 
 # -------------------------
 # Configuration
@@ -52,6 +54,76 @@ def vwap(df: pd.DataFrame) -> pd.Series:
 def pct(x: float) -> str:
     """Format percentage"""
     return f"{x*100:.2f}%"
+
+# -------------------------
+# Notifications
+# -------------------------
+def send_telegram_notification(bot_token: str, chat_id: str, signal: Dict, symbol: str) -> bool:
+    """Send signal notification via Telegram"""
+    if not bot_token or not chat_id or bot_token == "YOUR_BOT_TOKEN":
+        return False
+    
+    try:
+        emoji = "🟢" if signal["type"] == "BUY" else "🔴"
+        
+        message = (
+            f"{emoji} <b>{signal['type']} SIGNAL - {symbol}</b>\n\n"
+            f"💰 <b>Entry:</b> {signal['entry']:.5f}\n"
+            f"🛑 <b>Stop Loss:</b> {signal['sl']:.5f}\n"
+            f"🎯 <b>Take Profit:</b> {signal['tp']:.5f}\n"
+            f"📊 <b>R:R:</b> {signal.get('rr', 0):.2f}\n"
+            f"✅ <b>Důvěra:</b> {signal['confidence']}%\n\n"
+            f"📝 <i>{signal['reason']}</i>\n\n"
+            f"🕐 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+        
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        data = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
+        response = requests.post(url, data=data, timeout=10)
+        return response.status_code == 200
+        
+    except Exception as e:
+        st.warning(f"Chyba při odesílání Telegram notifikace: {str(e)}")
+        return False
+
+def send_discord_notification(webhook_url: str, signal: Dict, symbol: str) -> bool:
+    """Send signal notification via Discord webhook"""
+    if not webhook_url or webhook_url == "YOUR_WEBHOOK_URL":
+        return False
+    
+    try:
+        emoji = "🟢" if signal["type"] == "BUY" else "🔴"
+        color = 0x00ff00 if signal["type"] == "BUY" else 0xff0000
+        
+        embed = {
+            "title": f"{emoji} {signal['type']} SIGNAL - {symbol}",
+            "color": color,
+            "fields": [
+                {"name": "💰 Entry", "value": f"{signal['entry']:.5f}", "inline": True},
+                {"name": "🛑 Stop Loss", "value": f"{signal['sl']:.5f}", "inline": True},
+                {"name": "🎯 Take Profit", "value": f"{signal['tp']:.5f}", "inline": True},
+                {"name": "📊 R:R", "value": f"{signal.get('rr', 0):.2f}", "inline": True},
+                {"name": "✅ Důvěra", "value": f"{signal['confidence']}%", "inline": True},
+                {"name": "📝 Důvod", "value": signal['reason'], "inline": False}
+            ],
+            "footer": {
+                "text": f"Trading Copilot Pro • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+            }
+        }
+        
+        data = {"embeds": [embed]}
+        
+        response = requests.post(webhook_url, json=data, timeout=10)
+        return response.status_code == 204
+        
+    except Exception as e:
+        st.warning(f"Chyba při odesílání Discord notifikace: {str(e)}")
+        return False
 
 # -------------------------
 # Data Loading
@@ -350,6 +422,58 @@ with st.sidebar:
     )
     
     st.markdown("---")
+    st.markdown("### 🔔 Notifikace")
+    
+    notification_type = st.selectbox(
+        "Typ notifikace",
+        ["Vypnuto", "Telegram", "Discord"],
+        index=0
+    )
+    
+    telegram_bot_token = ""
+    telegram_chat_id = ""
+    discord_webhook = ""
+    
+    if notification_type == "Telegram":
+        st.info("📱 **Jak nastavit Telegram:**\n1. Otevři [@BotFather](https://t.me/botfather)\n2. Napiš `/newbot` a vytvoř bota\n3. Zkopíruj Bot Token\n4. Najdi svůj Chat ID přes [@userinfobot](https://t.me/userinfobot)")
+        telegram_bot_token = st.text_input("Bot Token", type="password", placeholder="123456:ABC-DEF...")
+        telegram_chat_id = st.text_input("Chat ID", placeholder="123456789")
+        
+        if st.button("🧪 Testovat Telegram"):
+            test_signal = {
+                "type": "BUY",
+                "entry": 1.2345,
+                "sl": 1.2300,
+                "tp": 1.2400,
+                "confidence": 75,
+                "reason": "Test notifikace",
+                "rr": 1.5
+            }
+            if send_telegram_notification(telegram_bot_token, telegram_chat_id, test_signal, "TEST"):
+                st.success("✅ Telegram funguje!")
+            else:
+                st.error("❌ Zkontroluj token a chat ID")
+    
+    elif notification_type == "Discord":
+        st.info("💬 **Jak nastavit Discord:**\n1. Otevři Server Settings\n2. Integrations → Webhooks\n3. New Webhook\n4. Zkopíruj Webhook URL")
+        discord_webhook = st.text_input("Webhook URL", type="password", placeholder="https://discord.com/api/webhooks/...")
+        
+        if st.button("🧪 Testovat Discord"):
+            test_signal = {
+                "type": "BUY",
+                "entry": 1.2345,
+                "sl": 1.2300,
+                "tp": 1.2400,
+                "confidence": 75,
+                "reason": "Test notifikace",
+                "rr": 1.5
+            }
+            if send_discord_notification(discord_webhook, test_signal, "TEST"):
+                st.success("✅ Discord funguje!")
+            else:
+                st.error("❌ Zkontroluj webhook URL")
+    
+    st.markdown("---")
     min_confidence = st.slider("Min. důvěra signálu (%)", 40, 80, 60)
 
 # Strategy parameters
@@ -390,6 +514,9 @@ if refresh_sec > 0:
 # -------------------------
 if "journal" not in st.session_state:
     st.session_state.journal = []
+
+if "notified_signals" not in st.session_state:
+    st.session_state.notified_signals = set()  # Track which signals were already sent
 
 # -------------------------
 # Main Dashboard
@@ -446,6 +573,26 @@ with st.spinner("Načítám data..."):
                 signal_txt = f"{'🟢' if sig['type']=='BUY' else '🔴'} {sig['type']}"
                 conf = f"{sig['confidence']}%"
                 rr = f"{sig.get('rr', 0):.2f}"
+                
+                # Send notification if enabled and not already sent
+                signal_key = f"{sym}_{sig['type']}_{sig['entry']:.5f}"
+                
+                if signal_key not in st.session_state.notified_signals:
+                    notification_sent = False
+                    
+                    if notification_type == "Telegram" and telegram_bot_token and telegram_chat_id:
+                        if send_telegram_notification(telegram_bot_token, telegram_chat_id, sig, sym):
+                            notification_sent = True
+                    
+                    elif notification_type == "Discord" and discord_webhook:
+                        if send_discord_notification(discord_webhook, sig, sym):
+                            notification_sent = True
+                    
+                    if notification_sent:
+                        st.session_state.notified_signals.add(signal_key)
+                        # Keep only last 50 signals in memory
+                        if len(st.session_state.notified_signals) > 50:
+                            st.session_state.notified_signals = set(list(st.session_state.notified_signals)[-50:])
             
             price_fmt = f"{close_val:.5f}" if 'JPY' not in sym else f"{close_val:.3f}"
             
@@ -469,6 +616,12 @@ watch_df = pd.DataFrame(
 )
 
 st.markdown("### 📊 Přehled trhů")
+
+# Show notification status
+if notification_type != "Vypnuto":
+    notif_emoji = "📱" if notification_type == "Telegram" else "💬"
+    st.caption(f"{notif_emoji} Notifikace: **{notification_type}** aktivní")
+
 st.dataframe(
     watch_df,
     use_container_width=True,
@@ -632,8 +785,21 @@ else:
 # Footer
 # -------------------------
 st.markdown("---")
-st.caption(
-    "⚠️ **Upozornění:** Tento nástroj slouží pouze pro vzdělávací účely. "
-    "Není to investiční poradenství. Trading je rizikový. "
-    "Data z yfinance mohou mít zpoždění ~5 minut."
-)
+
+if notification_type != "Vypnuto":
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.caption(
+            "⚠️ **Upozornění:** Tento nástroj slouží pouze pro vzdělávací účely. "
+            "Není to investiční poradenství. Trading je rizikový. "
+            "Data z yfinance mohou mít zpoždění ~5 minut."
+        )
+    with col2:
+        total_notified = len(st.session_state.notified_signals)
+        st.metric("🔔 Odesláno notifikací", total_notified)
+else:
+    st.caption(
+        "⚠️ **Upozornění:** Tento nástroj slouží pouze pro vzdělávací účely. "
+        "Není to investiční poradenství. Trading je rizikový. "
+        "Data z yfinance mohou mít zpoždění ~5 minut."
+    )
