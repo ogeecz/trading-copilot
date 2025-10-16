@@ -60,7 +60,11 @@ def pct(x: float) -> str:
 # -------------------------
 def send_telegram_notification(bot_token: str, chat_id: str, signal: Dict, symbol: str) -> bool:
     """Send signal notification via Telegram"""
-    if not bot_token or not chat_id or bot_token == "YOUR_BOT_TOKEN":
+    # Clean inputs
+    bot_token = bot_token.strip() if bot_token else ""
+    chat_id = chat_id.strip() if chat_id else ""
+    
+    if not bot_token or not chat_id or len(bot_token) < 10:
         return False
     
     try:
@@ -78,17 +82,26 @@ def send_telegram_notification(bot_token: str, chat_id: str, signal: Dict, symbo
         )
         
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        data = {
+        payload = {
             "chat_id": chat_id,
             "text": message,
             "parse_mode": "HTML"
         }
         
-        response = requests.post(url, data=data, timeout=10)
-        return response.status_code == 200
+        response = requests.post(url, data=payload, timeout=10)
         
+        if response.status_code != 200:
+            error_msg = response.json().get('description', 'Unknown error')
+            st.error(f"❌ Telegram chyba: {error_msg}")
+            return False
+        
+        return True
+        
+    except requests.exceptions.Timeout:
+        st.error("❌ Telegram timeout - zkus to znovu")
+        return False
     except Exception as e:
-        st.warning(f"Chyba při odesílání Telegram notifikace: {str(e)}")
+        st.error(f"❌ Telegram chyba: {str(e)}")
         return False
 
 def send_discord_notification(webhook_url: str, signal: Dict, symbol: str) -> bool:
