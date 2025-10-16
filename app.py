@@ -16,6 +16,11 @@ import json
 DEFAULT_PAIRS = ["USDCAD=X", "EURUSD=X", "GBPUSD=X", "USDJPY=X"]
 INTERVALS = ["5m", "15m", "30m", "1h"]
 
+# Telegram notification settings (hardcoded)
+TELEGRAM_BOT_TOKEN = "8262911672:AAHxE3lB1ysY0imlPXZxMs_e-WqT6PRTEcA"
+TELEGRAM_CHAT_ID = "8238812539"
+NOTIFICATIONS_ENABLED = True
+
 # -------------------------
 # Helpers (Indicators)
 # -------------------------
@@ -58,13 +63,9 @@ def pct(x: float) -> str:
 # -------------------------
 # Notifications
 # -------------------------
-def send_telegram_notification(bot_token: str, chat_id: str, signal: Dict, symbol: str) -> bool:
+def send_telegram_notification(signal: Dict, symbol: str) -> bool:
     """Send signal notification via Telegram"""
-    # Clean inputs
-    bot_token = bot_token.strip() if bot_token else ""
-    chat_id = chat_id.strip() if chat_id else ""
-    
-    if not bot_token or not chat_id or len(bot_token) < 10:
+    if not NOTIFICATIONS_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     
     try:
@@ -81,61 +82,17 @@ def send_telegram_notification(bot_token: str, chat_id: str, signal: Dict, symbo
             f"🕐 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
         )
         
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
-            "chat_id": chat_id,
+            "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
             "parse_mode": "HTML"
         }
         
-        response = requests.post(url, data=payload, timeout=10)
+        response = requests.post(url, data=payload, timeout=5)
+        return response.status_code == 200
         
-        if response.status_code != 200:
-            error_msg = response.json().get('description', 'Unknown error')
-            st.error(f"❌ Telegram chyba: {error_msg}")
-            return False
-        
-        return True
-        
-    except requests.exceptions.Timeout:
-        st.error("❌ Telegram timeout - zkus to znovu")
-        return False
-    except Exception as e:
-        st.error(f"❌ Telegram chyba: {str(e)}")
-        return False
-
-def send_discord_notification(webhook_url: str, signal: Dict, symbol: str) -> bool:
-    """Send signal notification via Discord webhook"""
-    if not webhook_url or webhook_url == "YOUR_WEBHOOK_URL":
-        return False
-    
-    try:
-        emoji = "🟢" if signal["type"] == "BUY" else "🔴"
-        color = 0x00ff00 if signal["type"] == "BUY" else 0xff0000
-        
-        embed = {
-            "title": f"{emoji} {signal['type']} SIGNAL - {symbol}",
-            "color": color,
-            "fields": [
-                {"name": "💰 Entry", "value": f"{signal['entry']:.5f}", "inline": True},
-                {"name": "🛑 Stop Loss", "value": f"{signal['sl']:.5f}", "inline": True},
-                {"name": "🎯 Take Profit", "value": f"{signal['tp']:.5f}", "inline": True},
-                {"name": "📊 R:R", "value": f"{signal.get('rr', 0):.2f}", "inline": True},
-                {"name": "✅ Důvěra", "value": f"{signal['confidence']}%", "inline": True},
-                {"name": "📝 Důvod", "value": signal['reason'], "inline": False}
-            ],
-            "footer": {
-                "text": f"Trading Copilot Pro • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-            }
-        }
-        
-        data = {"embeds": [embed]}
-        
-        response = requests.post(webhook_url, json=data, timeout=10)
-        return response.status_code == 204
-        
-    except Exception as e:
-        st.warning(f"Chyba při odesílání Discord notifikace: {str(e)}")
+    except Exception:
         return False
 
 # -------------------------
@@ -435,179 +392,20 @@ with st.sidebar:
     )
     
     st.markdown("---")
-    st.markdown("### 🔔 Notifikace")
+    st.markdown("### 🔄 Auto-refresh")
     
-    # Initialize notification settings in session state
-    if "notification_type" not in st.session_state:
-        st.session_state.notification_type = "Vypnuto"
-    
-    # Load from secrets if available
-    try:
-        default_token = st.secrets.get("telegram", {}).get("bot_token", "")
-        default_chat_id = st.secrets.get("telegram", {}).get("chat_id", "")
-    except:
-        default_token = ""
-        default_chat_id = ""
-    
-    if "telegram_bot_token" not in st.session_state:
-        st.session_state.telegram_bot_token = default_token
-    if "telegram_chat_id" not in st.session_state:
-        st.session_state.telegram_chat_id = default_chat_id
-    if "discord_webhook" not in st.session_state:
-        st.session_state.discord_webhook = ""
-    
-    # Auto-enable Telegram if secrets are configured
-    if default_token and default_chat_id and st.session_state.notification_type == "Vypnuto":
-        st.session_state.notification_type = "Telegram"
-    
-    notification_type = st.selectbox(
-        "Typ notifikace",
-        ["Vypnuto", "Telegram", "Discord"],
-        index=["Vypnuto", "Telegram", "Discord"].index(st.session_state.notification_type),
-        key="notif_type_select"
+    autorefresh = st.selectbox(
+        "Obnovovací interval",
+        ["Vypnuto", "30s", "60s", "120s"],
+        index=2
     )
-    st.session_state.notification_type = notification_type
-    
-    telegram_bot_token = ""
-    telegram_chat_id = ""
-    discord_webhook = ""
-    
-    if notification_type == "Telegram":
-        # Check if credentials are loaded from secrets
-        has_secrets = bool(default_token and default_chat_id)
-        
-        if has_secrets:
-            st.success("✅ Telegram údaje načteny z konfigurace!")
-        
-        st.markdown("📱 **Jak nastavit Telegram:**")
-        
-        with st.expander("📖 Krok za krokem návod", expanded=not has_secrets):
-            st.markdown("""
-            **1. Vytvoř bota:**
-            - Otevři @BotFather: https://t.me/botfather
-            - Napiš: `/newbot`
-            - Zadej jméno: např. `My Trading Bot`
-            - Zadej username: např. `MyTrading123_bot` (musí končit na `_bot`)
-            - Zkopíruj **Bot Token**
-            
-            **2. Spusť bota:**
-            - Otevři svého nového bota (klikni na odkaz od BotFathera)
-            - Klikni **START** nebo napiš `/start`
-            - ⚠️ **BEZ TOHOTO KROKU TO NEBUDE FUNGOVAT!**
-            
-            **3. Najdi své Chat ID (TVOJE číslo, ne username bota!):**
-            
-            **Způsob A - jednodušší:**
-            - Otevři @userinfobot: https://t.me/userinfobot
-            - Klikni START
-            - Bot ti pošle tvoje **ID** (číslo jako `123456789`)
-            
-            **Způsob B - přes API:**
-            - Otevři v prohlížeči: `https://api.telegram.org/bot[BOT_TOKEN]/getUpdates`
-            - Nahraď `[BOT_TOKEN]` za svůj token
-            - Najdi `"chat":{"id":123456789}` - to je tvoje ID!
-            
-            **4. Ulož natrvalo (volitelné):**
-            - Vytvoř soubor `.streamlit/secrets.toml` ve stejné složce jako app.py
-            - Přidej:
-            ```
-            [telegram]
-            bot_token = "tvůj_token"
-            chat_id = "tvoje_id"
-            ```
-            - Při dalším spuštění se načte automaticky!
-            """)
-        
-        if not has_secrets:
-            st.info("💡 **Důležité:** Chat ID je ČÍSLO (např. `123456789`), ne username s @ !")
-        
-        telegram_bot_token = st.text_input(
-            "Bot Token", 
-            value=st.session_state.telegram_bot_token,
-            type="password", 
-            placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz",
-            help="Token z @BotFather (formát: číslo:text)" + (" - načteno z konfigurace" if has_secrets else ""),
-            disabled=has_secrets
-        )
-        if not has_secrets:
-            st.session_state.telegram_bot_token = telegram_bot_token
-        
-        telegram_chat_id = st.text_input(
-            "Chat ID (TVOJE číslo, ne @username!)", 
-            value=st.session_state.telegram_chat_id,
-            placeholder="123456789",
-            help="Tvoje numeric ID z @userinfobot - JE TO ČÍSLO, ne @username!" + (" - načteno z konfigurace" if has_secrets else ""),
-            disabled=has_secrets
-        )
-        if not has_secrets:
-            st.session_state.telegram_chat_id = telegram_chat_id
-        
-        # Validate chat ID format
-        if telegram_chat_id and not telegram_chat_id.lstrip('-').isdigit():
-            st.error("❌ Chat ID musí být ČÍSLO! Například: `123456789` nebo `-123456789`\n\n"
-                    "Nemá to být `@username`! Použij @userinfobot pro zjištění tvého ID.")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🧪 Test zpráva", type="primary", use_container_width=True):
-                if not telegram_bot_token or not telegram_chat_id:
-                    st.error("❌ Vyplň Bot Token i Chat ID!")
-                elif not telegram_chat_id.lstrip('-').isdigit():
-                    st.error("❌ Chat ID musí být číslo, ne @username!")
-                else:
-                    with st.spinner("Odesílám test..."):
-                        test_signal = {
-                            "type": "BUY",
-                            "entry": 1.2345,
-                            "sl": 1.2300,
-                            "tp": 1.2400,
-                            "confidence": 75,
-                            "reason": "🎉 Test notifikace - Trading Copilot funguje!",
-                            "rr": 1.5
-                        }
-                        if send_telegram_notification(telegram_bot_token, telegram_chat_id, test_signal, "TEST"):
-                            st.success("✅ Telegram funguje! Zkontroluj zprávu v Telegramu 📱")
-                        else:
-                            st.markdown("""
-                            **Checklist:**
-                            - ✓ Klikl jsi START ve svém botovi?
-                            - ✓ Chat ID je ČÍSLO (ne @username)?
-                            - ✓ Token je správně zkopírovaný?
-                            """)
-        
-        with col2:
-            if st.button("🗑️ Smazat údaje", use_container_width=True):
-                st.session_state.telegram_bot_token = ""
-                st.session_state.telegram_chat_id = ""
-                st.rerun()
-    
-    elif notification_type == "Discord":
-        st.info("💬 **Jak nastavit Discord:**\n1. Otevři Server Settings\n2. Integrations → Webhooks\n3. New Webhook\n4. Zkopíruj Webhook URL")
-        discord_webhook = st.text_input(
-            "Webhook URL",
-            value=st.session_state.discord_webhook,
-            type="password",
-            placeholder="https://discord.com/api/webhooks/..."
-        )
-        st.session_state.discord_webhook = discord_webhook
-        
-        if st.button("🧪 Testovat Discord"):
-            test_signal = {
-                "type": "BUY",
-                "entry": 1.2345,
-                "sl": 1.2300,
-                "tp": 1.2400,
-                "confidence": 75,
-                "reason": "Test notifikace",
-                "rr": 1.5
-            }
-            if send_discord_notification(discord_webhook, test_signal, "TEST"):
-                st.success("✅ Discord funguje!")
-            else:
-                st.error("❌ Zkontroluj webhook URL")
     
     st.markdown("---")
     min_confidence = st.slider("Min. důvěra signálu (%)", 40, 80, 60)
+    
+    st.markdown("---")
+    st.success("📱 Telegram notifikace: **AKTIVNÍ**")
+    st.caption(f"Bot: @Oslicek_bot")
 
 # Strategy parameters
 params = {
@@ -707,21 +505,11 @@ with st.spinner("Načítám data..."):
                 conf = f"{sig['confidence']}%"
                 rr = f"{sig.get('rr', 0):.2f}"
                 
-                # Send notification if enabled and not already sent
+                # Send notification if not already sent
                 signal_key = f"{sym}_{sig['type']}_{sig['entry']:.5f}"
                 
                 if signal_key not in st.session_state.notified_signals:
-                    notification_sent = False
-                    
-                    if notification_type == "Telegram" and telegram_bot_token and telegram_chat_id:
-                        if send_telegram_notification(telegram_bot_token, telegram_chat_id, sig, sym):
-                            notification_sent = True
-                    
-                    elif notification_type == "Discord" and discord_webhook:
-                        if send_discord_notification(discord_webhook, sig, sym):
-                            notification_sent = True
-                    
-                    if notification_sent:
+                    if send_telegram_notification(sig, sym):
                         st.session_state.notified_signals.add(signal_key)
                         # Keep only last 50 signals in memory
                         if len(st.session_state.notified_signals) > 50:
@@ -749,11 +537,6 @@ watch_df = pd.DataFrame(
 )
 
 st.markdown("### 📊 Přehled trhů")
-
-# Show notification status
-if notification_type != "Vypnuto":
-    notif_emoji = "📱" if notification_type == "Telegram" else "💬"
-    st.caption(f"{notif_emoji} Notifikace: **{notification_type}** aktivní")
 
 st.dataframe(
     watch_df,
@@ -919,20 +702,13 @@ else:
 # -------------------------
 st.markdown("---")
 
-if notification_type != "Vypnuto":
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.caption(
-            "⚠️ **Upozornění:** Tento nástroj slouží pouze pro vzdělávací účely. "
-            "Není to investiční poradenství. Trading je rizikový. "
-            "Data z yfinance mohou mít zpoždění ~5 minut."
-        )
-    with col2:
-        total_notified = len(st.session_state.notified_signals)
-        st.metric("🔔 Odesláno notifikací", total_notified)
-else:
+col1, col2 = st.columns([3, 1])
+with col1:
     st.caption(
         "⚠️ **Upozornění:** Tento nástroj slouží pouze pro vzdělávací účely. "
         "Není to investiční poradenství. Trading je rizikový. "
         "Data z yfinance mohou mít zpoždění ~5 minut."
     )
+with col2:
+    total_notified = len(st.session_state.notified_signals)
+    st.metric("📱 Telegram zpráv", total_notified)
