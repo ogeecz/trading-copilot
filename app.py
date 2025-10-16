@@ -10,62 +10,60 @@ from typing import Optional, Dict
 import requests
 
 # ===== KONFIGURACE =====
-DEFAULT_PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY", "USD_CAD"]
-INTERVALS = ["M5", "M15", "M30", "H1"]
+DEFAULT_PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "NZD/USD"]
+INTERVALS = ["5min", "15min", "30min", "1h"]
 
-# Oanda to yfinance mapping
-OANDA_TO_YF = {
-    "EUR_USD": "EURUSD=X",
-    "GBP_USD": "GBPUSD=X", 
-    "USD_JPY": "USDJPY=X",
-    "USD_CAD": "USDCAD=X",
-    "AUD_USD": "AUDUSD=X",
-    "NZD_USD": "NZDUSD=X"
+# Twelve Data to yfinance mapping
+TD_TO_YF = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X", 
+    "USD/JPY": "USDJPY=X",
+    "USD/CAD": "USDCAD=X",
+    "AUD/USD": "AUDUSD=X",
+    "NZD/USD": "NZDUSD=X"
 }
 
-# ===== OANDA API FUNKCE =====
-def fetch_oanda_data(instrument: str, granularity: str, count: int, api_key: str, account_id: str) -> pd.DataFrame:
-    """Fetch real-time data from Oanda API"""
+# ===== TWELVE DATA API =====
+def fetch_twelvedata(symbol: str, interval: str, api_key: str) -> pd.DataFrame:
+    """Fetch real-time forex data from Twelve Data API"""
     try:
-        url = f"https://api-fxtrade.oanda.com/v3/instruments/{instrument}/candles"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
+        url = "https://api.twelvedata.com/time_series"
         params = {
-            "granularity": granularity,
-            "count": count
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": 500,
+            "apikey": api_key,
+            "format": "JSON"
         }
         
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response = requests.get(url, params=params, timeout=10)
         
         if response.status_code != 200:
             return pd.DataFrame()
         
         data = response.json()
-        candles = data.get("candles", [])
         
-        if not candles:
+        if "values" not in data or not data["values"]:
             return pd.DataFrame()
         
         rows = []
-        for candle in candles:
-            if candle["complete"]:
-                rows.append({
-                    "Datetime": pd.to_datetime(candle["time"]),
-                    "Open": float(candle["mid"]["o"]),
-                    "High": float(candle["mid"]["h"]),
-                    "Low": float(candle["mid"]["l"]),
-                    "Close": float(candle["mid"]["c"]),
-                    "Volume": float(candle["volume"])
-                })
+        for candle in data["values"]:
+            rows.append({
+                "Datetime": pd.to_datetime(candle["datetime"]),
+                "Open": float(candle["open"]),
+                "High": float(candle["high"]),
+                "Low": float(candle["low"]),
+                "Close": float(candle["close"]),
+                "Volume": float(candle.get("volume", 1000))
+            })
         
         df = pd.DataFrame(rows)
-        df["Datetime"] = pd.to_datetime(df["Datetime"]).dt.tz_localize(None)
+        df = df.sort_values("Datetime").reset_index(drop=True)
+        df["Datetime"] = pd.to_datetime(df["Datetime"])
         return df
         
     except Exception as e:
-        st.warning(f"Oanda API chyba pro {instrument}: {str(e)}")
+        st.warning(f"Twelve Data chyba pro {symbol}: {str(e)}")
         return pd.DataFrame()
 
 # ===== TECHNICKÉ INDIKÁTORY =====
@@ -125,23 +123,21 @@ def send_telegram_notification(bot_token: str, chat_id: str, signal: Dict, symbo
 
 # ===== DATA LOADING =====
 @st.cache_data(ttl=60, show_spinner=False)
-def load_data(symbol: str, interval: str, use_oanda: bool, oanda_api_key: str, oanda_account: str) -> pd.DataFrame:
-    """Load data from Oanda or yfinance fallback"""
+def load_data(symbol: str, interval: str, use_twelvedata: bool, api_key: str) -> pd.DataFrame:
+    """Load data from Twelve Data or yfinance fallback"""
     
-    if use_oanda and oanda_api_key and oanda_account:
-        # Oanda API
-        count_map = {"M5": 2000, "M15": 1500, "M30": 1000, "H1": 500}
-        count = count_map.get(interval, 1000)
-        df = fetch_oanda_data(symbol, interval, count, oanda_api_key, oanda_account)
+    if use_twelvedata and api_key:
+        # Twelve Data API
+        df = fetch_twelvedata(symbol, interval, api_key)
         
         if not df.empty:
             return df
         else:
-            st.warning(f"⚠️ Oanda selhala, fallback na yfinance pro {symbol}")
+            st.warning(f"⚠️ Twelve Data selhala, fallback na yfinance pro {symbol}")
     
     # Fallback na yfinance
-    yf_symbol = OANDA_TO_YF.get(symbol, "EURUSD=X")
-    yf_interval_map = {"M5": "5m", "M15": "15m", "M30": "30m", "H1": "1h"}
+    yf_symbol = TD_TO_YF.get(symbol, "EURUSD=X")
+    yf_interval_map = {"5min": "5m", "15min": "15m", "30min": "30m", "1h": "1h"}
     yf_interval = yf_interval_map.get(interval, "5m")
     
     try:
@@ -264,7 +260,7 @@ def calculate_position_size(account_balance: float, risk_pct: float, entry: floa
     risk_distance = abs(entry - sl)
     if risk_distance < 0.00001:
         return {"lot_size": 0.01, "risk_amount": 0.0, "pips": 0.0}
-    if "JPY" in symbol:
+    if "JPY" in symbol or "/JPY" in symbol:
         pips = risk_distance / 0.01
     else:
         pips = risk_distance / 0.0001
@@ -273,21 +269,24 @@ def calculate_position_size(account_balance: float, risk_pct: float, entry: floa
 
 # ===== STREAMLIT UI =====
 st.set_page_config(page_title="Trading Copilot Pro", layout="wide", initial_sidebar_state="expanded")
-st.markdown("<h1>🚀 Trading Copilot Pro — Real-Time FX</h1>", unsafe_allow_html=True)
+st.markdown("<h1>🚀 Trading Copilot Pro — FX Signály</h1>", unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown("### 🔌 Data Source")
     
-    use_oanda = st.checkbox("Použít Oanda API (real-time)", value=False)
+    use_twelvedata = st.checkbox("Použít Twelve Data API (real-time)", value=False)
     
-    if use_oanda:
-        st.info("📊 **Jak získat Oanda API:**\n1. Jdi na oanda.com\n2. Vytvoř demo/live účet\n3. API → Personal Token\n4. Zkopíruj API Key a Account ID")
-        oanda_api_key = st.text_input("Oanda API Key", type="password", placeholder="abc123...")
-        oanda_account = st.text_input("Oanda Account ID", placeholder="123-456-7890123-001")
+    if use_twelvedata:
+        st.info("📊 **Jak získat Twelve Data API:**\n\n1. Jdi na [twelvedata.com](https://twelvedata.com)\n2. Vytvoř FREE účet\n3. Dashboard → API Key\n4. Zkopíruj klíč\n\n**Free tier:** 800 requests/den")
+        twelvedata_api_key = st.text_input("Twelve Data API Key", type="password", placeholder="abc123def456...")
+        
+        if twelvedata_api_key:
+            st.success("✅ API Key vyplněn")
+        else:
+            st.warning("⚠️ Vyplň API Key")
     else:
         st.info("📊 Použije se yfinance (5min zpoždění)")
-        oanda_api_key = ""
-        oanda_account = ""
+        twelvedata_api_key = ""
     
     st.markdown("---")
     st.markdown("### ⚙️ Nastavení")
@@ -378,7 +377,7 @@ if "notified" not in st.session_state:
     st.session_state.notified = set()
 
 # Info bar
-data_source = "🟢 Oanda (Real-time)" if (use_oanda and oanda_api_key and oanda_account) else "🟡 yfinance (~5min delay)"
+data_source = "🟢 Twelve Data (Real-time)" if (use_twelvedata and twelvedata_api_key) else "🟡 yfinance (~5min delay)"
 telegram_active = enable_telegram and telegram_token and telegram_chat and telegram_chat.lstrip('-').isdigit()
 notif_status = "🔔 Telegram ON" if telegram_active else "🔕 Telegram OFF"
 st.caption(f"{data_source} • Interval: {interval} • {notif_status} • {datetime.utcnow().strftime('%H:%M:%S')} UTC")
@@ -389,7 +388,7 @@ rows = []
 
 with st.spinner("Načítám data..."):
     for sym in pairs:
-        df = load_data(sym, interval, use_oanda, oanda_api_key, oanda_account)
+        df = load_data(sym, interval, use_twelvedata, twelvedata_api_key)
         if df.empty:
             rows.append([sym, "—", "—", "—", "—", "—", "—"])
             charts_data[sym] = df
@@ -420,13 +419,13 @@ with st.spinner("Načítám data..."):
                 signal_txt = f"{'🟢' if sig['type']=='BUY' else '🔴'} {sig['type']}"
                 conf = f"{sig['confidence']}%"
                 
-                # Send Telegram
+                # Send Telegram (only if properly configured)
                 sig_key = f"{sym}_{sig['type']}_{sig['entry']:.5f}"
-                if enable_telegram and sig_key not in st.session_state.notified:
+                if telegram_active and sig_key not in st.session_state.notified:
                     if send_telegram_notification(telegram_token, telegram_chat, sig, sym):
                         st.session_state.notified.add(sig_key)
             
-            price_fmt = f"{close:.5f}" if "JPY" not in sym else f"{close:.3f}"
+            price_fmt = f"{close:.5f}" if ("JPY" not in sym and "/JPY" not in sym) else f"{close:.3f}"
             rows.append([sym, trend, f"{rsi_val:.0f}", pct(from_vwap), price_fmt, signal_txt, conf])
         except:
             rows.append([sym, "—", "—", "—", "—", "—", "—"])
@@ -485,15 +484,18 @@ with col2:
 st.markdown("### 📖 Deník")
 if st.session_state.journal:
     jdf = pd.DataFrame(st.session_state.journal)
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Obchodů", len(jdf))
     col2.metric("Riziko", f"${jdf['risk'].sum():.2f}")
     col3.metric("Avg důvěra", f"{jdf['conf'].mean():.0f}%")
+    col4.metric("📱 Telegram", len(st.session_state.notified))
     st.dataframe(jdf, use_container_width=True, height=300)
     if st.button("🗑️ Vymazat"):
         st.session_state.journal = []
         st.rerun()
 else:
     st.info("📝 Prázdný deník")
+    if telegram_active:
+        st.caption(f"📱 Odesláno Telegram zpráv: {len(st.session_state.notified)}")
 
 st.caption("⚠️ Jen pro vzdělávání • Trading je rizikový • Nejde o investiční radu")
