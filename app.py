@@ -33,8 +33,8 @@ def atr(df: pd.DataFrame, window: int = 14):
     return tr.rolling(window).mean()
 
 def vwap(df: pd.DataFrame):
-    vol = (df["High"] - df["Low"]).replace(0, np.nan).fillna(method="ffill").fillna(1.0)
     tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    vol = df["Volume"].replace(0, np.nan).fillna(1.0)
     cum_vol = vol.cumsum()
     cum_pv = (tp * vol).cumsum()
     return cum_pv / cum_vol
@@ -75,9 +75,11 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     out["EMA20"] = ema(out["Close"], 20)
     out["EMA50"] = ema(out["Close"], 50)
     out["RSI"] = rsi(out["Close"], 14)
-    out["VWAP"] = vwap(out)
-    out["ATR"] = atr(out, 14)
-    out["FromVWAP"] = (out["Close"] / out["VWAP"]) - 1.0
+    out["VWAP"] = vwap(out).fillna(method="bfill").fillna(method="ffill")
+    out["ATR"] = atr(out, 14).fillna(method="bfill").fillna(method="ffill")
+
+    # Bezpečný výpočet FromVWAP
+    out["FromVWAP"] = np.where(out["VWAP"] != 0, (out["Close"] / out["VWAP"]) - 1.0, 0.0)
     out["TrendUp"] = (out["EMA20"] >= out["EMA50"]).astype(int)
     return out
 
@@ -152,7 +154,6 @@ if refresh_ms > 0:
         st.query_params.update({"_": str(int(time.time()))})
     except Exception:
         pass
-
     import threading
     def _ref():
         time.sleep(refresh_ms / 1000.0)
