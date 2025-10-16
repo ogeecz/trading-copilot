@@ -140,24 +140,33 @@ def signal_mean_reversion(df: pd.DataFrame, vwap_threshold: float, rsi_oversold:
         if not all(k in row.index for k in ["FromVWAP", "RSI", "EMA20", "EMA50", "Close", "ATR", "VWAP"]):
             return None
         
+        # Get scalar values
+        from_vwap = float(row["FromVWAP"])
+        rsi_val = float(row["RSI"])
+        ema20 = float(row["EMA20"])
+        ema50 = float(row["EMA50"])
+        close = float(row["Close"])
+        atr_val = float(row["ATR"])
+        vwap_val = float(row["VWAP"])
+        
         cond = (
-            (row["FromVWAP"] <= -vwap_threshold/100) and 
-            (row["RSI"] < rsi_oversold) and 
-            (row["EMA20"] >= row["EMA50"])
+            (from_vwap <= -vwap_threshold/100) and 
+            (rsi_val < rsi_oversold) and 
+            (ema20 >= ema50)
         )
         
         if not cond:
             return None
         
-        entry = float(row["Close"])
-        sl = entry - 1.5 * float(row["ATR"])
-        tp = float(row["VWAP"])
+        entry = close
+        sl = entry - 1.5 * atr_val
+        tp = vwap_val
         
         if abs(tp - entry) < 0.00001 or abs(entry - sl) < 0.00001:
             return None
         
-        conf = 60 + min(20, int(abs(row["FromVWAP"]) * 10000 / 2))
-        if row["RSI"] < rsi_boost:
+        conf = 60 + min(20, int(abs(from_vwap) * 10000 / 2))
+        if rsi_val < rsi_boost:
             conf += 5
         
         rr = abs((tp - entry) / (entry - sl))
@@ -168,7 +177,7 @@ def signal_mean_reversion(df: pd.DataFrame, vwap_threshold: float, rsi_oversold:
             "sl": sl,
             "tp": tp,
             "confidence": int(min(conf, 90)),
-            "reason": f"Mean Reversion→VWAP (RSI={row['RSI']:.0f}, {pct(row['FromVWAP'])} od VWAP)",
+            "reason": f"Mean Reversion→VWAP (RSI={rsi_val:.0f}, {pct(from_vwap)} od VWAP)",
             "rr": rr
         }
     except Exception:
@@ -185,40 +194,51 @@ def signal_vwap_breakout(df: pd.DataFrame, rsi_min: int, rsi_max: int) -> Option
         
         if not all(k in last.index for k in ["Close", "VWAP", "RSI", "EMA20", "EMA50", "ATR"]):
             return None
+        
+        # Get scalar values
+        last_close = float(last["Close"])
+        last_vwap = float(last["VWAP"])
+        last_rsi = float(last["RSI"])
+        last_ema20 = float(last["EMA20"])
+        last_ema50 = float(last["EMA50"])
+        last_atr = float(last["ATR"])
+        
+        prev_close = float(prev["Close"])
+        prev_vwap = float(prev["VWAP"])
 
         # Bullish breakout
-        if (prev["Close"] <= prev["VWAP"]) and (last["Close"] > last["VWAP"]) and \
-           (rsi_min <= last["RSI"] <= rsi_max) and (last["EMA20"] > last["EMA50"]):
-            entry = float(last["Close"])
-            risk = 1.2 * float(last["ATR"])
+        if (prev_close <= prev_vwap) and (last_close > last_vwap) and \
+           (rsi_min <= last_rsi <= rsi_max) and (last_ema20 > last_ema50):
+            entry = last_close
+            risk = 1.2 * last_atr
             sl = entry - risk
             tp = entry + 2.0 * risk
-            conf = 55 + min(25, int((last["RSI"] - 50) * 2))
+            conf = 55 + min(25, int((last_rsi - 50) * 2))
             return {
                 "type": "BUY",
                 "entry": entry,
                 "sl": sl,
                 "tp": tp,
                 "confidence": int(min(conf, 85)),
-                "reason": f"VWAP Breakout ↑ (RSI={last['RSI']:.0f})",
+                "reason": f"VWAP Breakout ↑ (RSI={last_rsi:.0f})",
                 "rr": 2.0
             }
 
         # Bearish breakout
-        if (prev["Close"] >= prev["VWAP"]) and (last["Close"] < last["VWAP"]) and \
-           (100 - rsi_max <= last["RSI"] <= 100 - rsi_min) and (last["EMA20"] < last["EMA50"]):
-            entry = float(last["Close"])
-            risk = 1.2 * float(last["ATR"])
+        if (prev_close >= prev_vwap) and (last_close < last_vwap) and \
+           (100 - rsi_max <= last_rsi <= 100 - rsi_min) and (last_ema20 < last_ema50):
+            entry = last_close
+            risk = 1.2 * last_atr
             sl = entry + risk
             tp = entry - 2.0 * risk
-            conf = 55 + min(25, int((50 - last["RSI"]) * 2))
+            conf = 55 + min(25, int((50 - last_rsi) * 2))
             return {
                 "type": "SELL",
                 "entry": entry,
                 "sl": sl,
                 "tp": tp,
                 "confidence": int(min(conf, 85)),
-                "reason": f"VWAP Breakout ↓ (RSI={last['RSI']:.0f})",
+                "reason": f"VWAP Breakout ↓ (RSI={last_rsi:.0f})",
                 "rr": 2.0
             }
     except Exception:
@@ -408,7 +428,14 @@ with st.spinner("Načítám data..."):
                 rows.append([sym, "—", "—", "—", "—", "—", "—"])
                 continue
             
-            trend = "📈 Up" if last["EMA20"] >= last["EMA50"] else "📉 Down"
+            # Get scalar values, not Series
+            ema20_val = float(last["EMA20"])
+            ema50_val = float(last["EMA50"])
+            rsi_val = float(last["RSI"])
+            from_vwap_val = float(last["FromVWAP"])
+            close_val = float(last["Close"])
+            
+            trend = "📈 Up" if ema20_val >= ema50_val else "📉 Down"
             sig = build_signal(df, params)
             
             signal_txt = "—"
@@ -420,13 +447,13 @@ with st.spinner("Načítám data..."):
                 conf = f"{sig['confidence']}%"
                 rr = f"{sig.get('rr', 0):.2f}"
             
-            price_fmt = f"{last['Close']:.5f}" if 'JPY' not in sym else f"{last['Close']:.3f}"
+            price_fmt = f"{close_val:.5f}" if 'JPY' not in sym else f"{close_val:.3f}"
             
             rows.append([
                 sym,
                 trend,
-                f"{last['RSI']:.0f}",
-                pct(last["FromVWAP"]),
+                f"{rsi_val:.0f}",
+                pct(from_vwap_val),
                 price_fmt,
                 signal_txt,
                 conf
