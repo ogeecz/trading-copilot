@@ -158,11 +158,18 @@ with st.sidebar:
 if "journal" not in st.session_state:
     st.session_state.journal = []
 
-# autorefresh
-map_refresh = {"Vypnuto": 0, "30 s": 30_000, "60 s": 60_000, "120 s": 120_000}
 if map_refresh[autorefresh]:
-    st.experimental_set_query_params(_=int(time.time()))  # aby se URL měnilo (kvůli cache)
-    st.autorefresh(interval=map_refresh[autorefresh], key="ref")
+    # Nový způsob – změní URL parametr, aby se obnovila cache
+    st.query_params.update({"_": str(int(time.time()))})
+    # Místo autorefresh použij rerun se sleepem (jednoduchý hack)
+    import threading
+
+    def refresher(wait):
+        time.sleep(wait)
+        st.rerun()
+
+    threading.Thread(target=refresher, args=(map_refresh[autorefresh] / 1000,)).start()
+
 
 cols = st.columns([1.2, 1.0])
 with cols[0]:
@@ -257,3 +264,4 @@ else:
     st.dataframe(journal_df, use_container_width=True, height=220)
 
 st.caption("Upozornění: Vzdělávací účely. Nejde o investiční doporučení. Data: yfinance (přibližně 5min).")
+
