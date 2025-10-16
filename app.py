@@ -132,27 +132,48 @@ TD_TO_YF = {
 
 def calculate_support_resistance(df: pd.DataFrame, window: int = 20) -> Tuple[List[float], List[float]]:
     """Detect key support and resistance levels"""
-    if len(df) < window * 2:
-        return [], []
-    
-    highs = df['High'].rolling(window=window, center=True).max()
-    lows = df['Low'].rolling(window=window, center=True).min()
-    
-    resistance_levels = []
-    support_levels = []
-    
-    for i in range(window, len(df) - window):
-        if df['High'].iloc[i] == highs.iloc[i] and df['High'].iloc[i] > df['High'].iloc[i-1] and df['High'].iloc[i] > df['High'].iloc[i+1]:
-            resistance_levels.append(float(df['High'].iloc[i]))
+    try:
+        if len(df) < window * 2:
+            return [], []
         
-        if df['Low'].iloc[i] == lows.iloc[i] and df['Low'].iloc[i] < df['Low'].iloc[i-1] and df['Low'].iloc[i] < df['Low'].iloc[i+1]:
-            support_levels.append(float(df['Low'].iloc[i]))
-    
-    # Keep only unique levels (within 0.1%)
-    resistance_levels = list(set([round(r, 5) for r in resistance_levels[-5:]]))
-    support_levels = list(set([round(s, 5) for s in support_levels[-5:]]))
-    
-    return support_levels, resistance_levels
+        highs = df['High'].rolling(window=window, center=True).max()
+        lows = df['Low'].rolling(window=window, center=True).min()
+        
+        resistance_levels = []
+        support_levels = []
+        
+        for i in range(window, len(df) - window):
+            try:
+                # Convert to scalar values for comparison
+                curr_high = float(df['High'].iloc[i])
+                curr_low = float(df['Low'].iloc[i])
+                prev_high = float(df['High'].iloc[i-1])
+                prev_low = float(df['Low'].iloc[i-1])
+                next_high = float(df['High'].iloc[i+1])
+                next_low = float(df['Low'].iloc[i+1])
+                rolling_high = float(highs.iloc[i])
+                rolling_low = float(lows.iloc[i])
+                
+                # Check for resistance (local high)
+                if abs(curr_high - rolling_high) < 0.00001 and curr_high > prev_high and curr_high > next_high:
+                    resistance_levels.append(curr_high)
+                
+                # Check for support (local low)
+                if abs(curr_low - rolling_low) < 0.00001 and curr_low < prev_low and curr_low < next_low:
+                    support_levels.append(curr_low)
+            except:
+                continue
+        
+        # Keep only unique levels (within 0.1%)
+        if resistance_levels:
+            resistance_levels = list(set([round(r, 5) for r in resistance_levels[-5:]]))
+        if support_levels:
+            support_levels = list(set([round(s, 5) for s in support_levels[-5:]]))
+        
+        return support_levels, resistance_levels
+    except Exception as e:
+        # Fail gracefully
+        return [], []
 
 def check_multi_timeframe_alignment(symbol: str, api_key: str, current_trend: str) -> Dict:
     """Check if higher timeframe confirms current trend"""
@@ -492,7 +513,7 @@ def load_data(symbol: str, interval: str, use_twelvedata: bool, api_key: str) ->
             df = fetch_twelvedata(symbol, interval, api_key)
             if not df.empty:
                 return df
-        except:
+        except Exception as e:
             pass  # Fall back to yfinance
     
     # Default: yfinance (always works, free)
@@ -502,27 +523,53 @@ def load_data(symbol: str, interval: str, use_twelvedata: bool, api_key: str) ->
     
     try:
         end = datetime.now(timezone.utc)
-        start = end - timedelta(days=7)
+        start = end - timedelta(days=5)  # Reduced from 7 to 5 for better reliability
+        
         df = yf.download(
             tickers=yf_symbol, 
             interval=yf_interval, 
             start=start.strftime("%Y-%m-%d"),
             end=end.strftime("%Y-%m-%d"), 
             progress=False, 
-            auto_adjust=False, 
+            auto_adjust=True,  # Changed to True for cleaner data
             prepost=False
         )
         
         if df.empty:
             return pd.DataFrame()
         
-        df = df.rename_axis("Datetime").reset_index()
+        # Reset index properly
+        df = df.reset_index()
+        
+        # Rename columns if needed
+        if 'Date' in df.columns:
+            df = df.rename(columns={'Date': 'Datetime'})
+        elif 'index' in df.columns:
+            df = df.rename(columns={'index': 'Datetime'})
+        
+        # Ensure Datetime column exists
+        if 'Datetime' not in df.columns:
+            return pd.DataFrame()
         
         # Handle timezone
-        if hasattr(df["Datetime"].iloc[0], "tzinfo") and df["Datetime"].dt.tz is not None:
-            df["Datetime"] = df["Datetime"].dt.tz_convert("UTC").dt.tz_localize(None)
+        try:
+            if hasattr(df["Datetime"].iloc[0], "tzinfo"):
+                if df["Datetime"].dt.tz is not None:
+                    df["Datetime"] = df["Datetime"].dt.tz_convert("UTC").dt.tz_localize(None)
+                else:
+                    df["Datetime"] = pd.to_datetime(df["Datetime"])
+        except:
+            df["Datetime"] = pd.to_datetime(df["Datetime"])
+        
+        # Ensure Volume column exists
+        if 'Volume' not in df.columns:
+            df['Volume'] = 1000.0
+        
+        # Fill any NaN values
+        df = df.ffill().bfill()
         
         return df
+        
     except Exception as e:
         # If everything fails, return empty
         return pd.DataFrame()
@@ -963,6 +1010,26 @@ is_weekend = now.weekday() >= 5  # Saturday = 5, Sunday = 6
 if is_weekend:
     st.warning("⏸️ **WEEKEND MODE** - Forex markets closed. Data may be stale. Opens Sunday 22:00 UTC.")
 
+# Check if we have any data
+has_data = any(not df.empty for df in charts_data.values())
+if not has_data and pairs:
+    st.error("""
+    ❌ **Unable to Load Market Data**
+    
+    **Possible causes:**
+    - yfinance API is down (common on weekends)
+    - Internet connection issues
+    - Markets are closed
+    
+    **Solutions:**
+    ✅ Add **Twelve Data API key** in sidebar for reliable real-time data
+    ✅ Wait 5-10 minutes and refresh the page
+    ✅ Check your internet connection
+    ✅ Try again during market hours (Mon-Fri)
+    
+    💡 **Tip:** With Twelve Data API, you get 99% uptime vs yfinance's ~70% uptime
+    """)
+
 watch_df = pd.DataFrame(rows, columns=["Pair", "Sentiment", "Trend", "RSI", "From VWAP", "Price", "Signal", "Confidence"])
 st.dataframe(watch_df, use_container_width=True, height=min(300, 50 + len(watch_df) * 40))
 
@@ -980,78 +1047,122 @@ with col_left:
         sel = st.selectbox("📌 Select Pair", pairs, index=0)
         df = charts_data.get(sel, pd.DataFrame())
         
-        if not df.empty and len(df) >= 60:
-            # Session info for selected pair
-            best_sessions = session_info['best_sessions'].get(sel, [])
-            is_good_time = session_info['current'] in best_sessions
+        if df.empty:
+            st.error(f"""
+            ❌ **No Data Available for {sel}**
             
-            if use_session_filter and not is_good_time:
-                st.warning(f"⏰ **Off-Peak Time**\n\nBest sessions: {', '.join(best_sessions)}\nCurrent: {session_info['current']}")
+            **Possible reasons:**
+            - Market is closed (weekend)
+            - yfinance API issues
+            - Internet connection problem
+            
+            **Solutions:**
+            - Wait a few minutes and refresh
+            - Try different pair
+            - Add Twelve Data API key for better reliability
+            - Check if it's weekend (markets closed)
+            """)
+        elif len(df) < 60:
+            st.warning(f"""
+            ⏳ **Insufficient Data for {sel}**
+            
+            Need at least 60 candles for analysis.
+            Current: {len(df)} candles
+            
+            Try again in a few minutes...
+            """)
+        else:
+            # Session info for selected pair
+            try:
+                best_sessions = session_info['best_sessions'].get(sel, [])
+                is_good_time = session_info['current'] in best_sessions
+                
+                if use_session_filter and not is_good_time:
+                    st.warning(f"⏰ **Off-Peak Time**\n\nBest sessions: {', '.join(best_sessions)}\nCurrent: {session_info['current']}")
+            except:
+                pass
             
             # Calculate levels
-            support_levels, resistance_levels = calculate_support_resistance(df)
-            
-            if use_sr_optimization and (support_levels or resistance_levels):
-                st.info(f"**📍 Key Levels:**\n\nSupport: {', '.join([f'{s:.5f}' for s in support_levels[:3]])}\nResistance: {', '.join([f'{r:.5f}' for r in resistance_levels[:3]])}")
+            try:
+                support_levels, resistance_levels = calculate_support_resistance(df)
+                
+                if use_sr_optimization and (support_levels or resistance_levels):
+                    supp_str = ', '.join([f'{s:.5f}' for s in support_levels[:3]]) if support_levels else "None"
+                    res_str = ', '.join([f'{r:.5f}' for r in resistance_levels[:3]]) if resistance_levels else "None"
+                    st.info(f"**📍 Key Levels:**\n\nSupport: {supp_str}\nResistance: {res_str}")
+            except:
+                support_levels, resistance_levels = [], []
             
             # Build signal
-            sig = build_signal(df, params, support_levels, resistance_levels)
+            try:
+                sig = build_signal(df, params, support_levels, resistance_levels)
+            except:
+                sig = None
             
             # MTF check
             if sig and use_mtf_filter:
-                sentiment = calculate_market_sentiment(df)
-                mtf = check_multi_timeframe_alignment(sel, twelvedata_api_key, sentiment)
-                
-                if mtf['aligned'] is None and not twelvedata_api_key:
-                    st.warning("⚠️ **MTF Filter enabled but needs API key**\n\nAdd Twelve Data API key to use MTF confirmation.")
-                elif mtf['aligned'] is False:
-                    st.error(f"❌ **MTF Conflict**\n\nCurrent: {sentiment}\n1H: {mtf['htf_trend']}\n\nWait for alignment!")
-                    sig = None
-                elif mtf['aligned'] is True:
-                    sig['confidence'] = min(95, sig['confidence'] + mtf['confidence_boost'])
-                    st.success(f"✅ **MTF Aligned** ({mtf['htf_trend']}) +{mtf['confidence_boost']}% confidence")
+                try:
+                    sentiment = calculate_market_sentiment(df)
+                    mtf = check_multi_timeframe_alignment(sel, twelvedata_api_key, sentiment)
+                    
+                    if mtf['aligned'] is None and not twelvedata_api_key:
+                        st.warning("⚠️ **MTF Filter enabled but needs API key**\n\nAdd Twelve Data API key to use MTF confirmation.")
+                    elif mtf['aligned'] is False:
+                        st.error(f"❌ **MTF Conflict**\n\nCurrent: {sentiment}\n1H: {mtf['htf_trend']}\n\nWait for alignment!")
+                        sig = None
+                    elif mtf['aligned'] is True:
+                        sig['confidence'] = min(95, sig['confidence'] + mtf['confidence_boost'])
+                        st.success(f"✅ **MTF Aligned** ({mtf['htf_trend']}) +{mtf['confidence_boost']}% confidence")
+                except:
+                    pass
             
             if sig and sig["confidence"] >= min_confidence:
-                pos = calculate_position_size(account_balance, risk_per_trade, sig["entry"], sig["sl"], sel)
-                emoji = "🟢" if sig["type"] == "BUY" else "🔴"
-                
-                # Calculate trailing stop
-                last_close = float(df.iloc[-1]["Close"])
-                last_atr = float(df.iloc[-1]["ATR"])
-                trailing = calculate_trailing_stop(sig['entry'], last_close, last_atr, sig['type'])
-                
-                st.success(f"""
-                ### {emoji} {sig['type']} SIGNAL
-                
-                **📊 Trade:**
-                - Entry: `{sig['entry']:.5f}`
-                - SL: `{sig['sl']:.5f}`
-                - TP: `{sig['tp']:.5f}`
-                - R:R: `{sig['rr']:.2f}`
-                - Conf: `{sig['confidence']}%`
-                
-                **💰 Position:**
-                - Lot: `{pos['lot_size']}`
-                - Risk: `${pos['risk_amount']}`
-                
-                **📝** {sig['reason']}
-                """)
-                
-                if trailing:
-                    st.info(f"🎯 **Trailing Stop:** {trailing:.5f}")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("✅ Take", type="primary", use_container_width=True):
-                        st.session_state.journal.append({
-                            "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                            "pair": sel, "type": sig["type"], "entry": sig["entry"],
-                            "sl": sig["sl"], "tp": sig["tp"], "lots": pos["lot_size"],
-                            "risk": pos["risk_amount"], "conf": sig["confidence"]
-                        })
-                        st.success("✅ Added!")
-                with col2:
-                    st.button("⏭ Skip", use_container_width=True)
+                try:
+                    pos = calculate_position_size(account_balance, risk_per_trade, sig["entry"], sig["sl"], sel)
+                    emoji = "🟢" if sig["type"] == "BUY" else "🔴"
+                    
+                    # Calculate trailing stop
+                    try:
+                        last_close = float(df.iloc[-1]["Close"])
+                        last_atr = float(df.iloc[-1]["ATR"])
+                        trailing = calculate_trailing_stop(sig['entry'], last_close, last_atr, sig['type'])
+                    except:
+                        trailing = None
+                    
+                    st.success(f"""
+                    ### {emoji} {sig['type']} SIGNAL
+                    
+                    **📊 Trade:**
+                    - Entry: `{sig['entry']:.5f}`
+                    - SL: `{sig['sl']:.5f}`
+                    - TP: `{sig['tp']:.5f}`
+                    - R:R: `{sig['rr']:.2f}`
+                    - Conf: `{sig['confidence']}%`
+                    
+                    **💰 Position:**
+                    - Lot: `{pos['lot_size']}`
+                    - Risk: `${pos['risk_amount']}`
+                    
+                    **📝** {sig['reason']}
+                    """)
+                    
+                    if trailing:
+                        st.info(f"🎯 **Trailing Stop:** {trailing:.5f}")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("✅ Take", type="primary", use_container_width=True):
+                            st.session_state.journal.append({
+                                "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                                "pair": sel, "type": sig["type"], "entry": sig["entry"],
+                                "sl": sig["sl"], "tp": sig["tp"], "lots": pos["lot_size"],
+                                "risk": pos["risk_amount"], "conf": sig["confidence"]
+                            })
+                            st.success("✅ Added!")
+                    with col2:
+                        st.button("⏭ Skip", use_container_width=True)
+                except Exception as e:
+                    st.error(f"⚠️ Error calculating position: {str(e)}")
             else:
                 st.info("""
                 😴 **No Quality Signals**
