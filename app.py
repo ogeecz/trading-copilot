@@ -117,10 +117,10 @@ def enrich(df: pd.DataFrame, ema_fast: int = 20, ema_slow: int = 50) -> pd.DataF
     out["BB_Mid"] = bb_mid
     out["BB_Lower"] = bb_lower
     
-    # Derived metrics
-    out["FromVWAP"] = np.where(out["VWAP"] != 0, (out["Close"] / out["VWAP"]) - 1.0, 0.0)
+    # Derived metrics (safe calculation to avoid division by zero)
+    out["FromVWAP"] = ((out["Close"] / out["VWAP"].replace(0, np.nan)) - 1.0).fillna(0.0).replace([np.inf, -np.inf], 0.0)
     out["TrendUp"] = (out["EMA20"] >= out["EMA50"]).astype(int)
-    out["BB_Width"] = (out["BB_Upper"] - out["BB_Lower"]) / out["BB_Mid"]
+    out["BB_Width"] = ((out["BB_Upper"] - out["BB_Lower"]) / out["BB_Mid"].replace(0, np.nan)).fillna(0.0).replace([np.inf, -np.inf], 0.0)
     
     return out
 
